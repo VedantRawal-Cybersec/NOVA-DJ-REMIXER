@@ -12,6 +12,7 @@ module.exports = async function handler(req, res) {
 
   const query = String(req.query.q || '').trim().slice(0, 160);
   const limit = Math.max(1, Math.min(12, Number.parseInt(req.query.limit || '10', 10) || 10));
+  const debug = req.query.debug === '1';
   if (!query) return send(res, 400, { error: 'Enter a song, artist, remix or genre.' });
 
   const apiKey = process.env.YOUTUBE_API_KEY;
@@ -21,7 +22,7 @@ module.exports = async function handler(req, res) {
       error: 'YouTube search is not configured.',
       message: 'YOUTUBE_API_KEY is missing from the Vercel Production environment.'
     };
-    return send(res, 503, result);
+    return send(res, debug ? 200 : 503, result);
   }
 
   try {
@@ -54,7 +55,7 @@ module.exports = async function handler(req, res) {
         providerStatus: searchResponse.status,
         providerMessage
       };
-      return send(res, 502, result);
+      return send(res, debug ? 200 : 502, result);
     }
 
     const items = Array.isArray(searchData.items) ? searchData.items : [];
@@ -120,6 +121,6 @@ module.exports = async function handler(req, res) {
       error: 'YouTube search is temporarily unavailable.',
       runtimeError: error?.name || 'unknown'
     };
-    return send(res, 502, result);
+    return send(res, debug ? 200 : 502, result);
   }
 };
