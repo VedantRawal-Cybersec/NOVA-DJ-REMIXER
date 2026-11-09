@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "^/api/youtube-search/?$",
+      "dest": "/api/youtube-search.js"
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "^/(.*)$",
+      "dest": "/api/proxy.js?path=/$1"
+    }
+  ]
+}
