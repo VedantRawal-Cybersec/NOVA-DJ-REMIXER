@@ -24,8 +24,8 @@ YouTube is used as a discovery and embedded playback source. The app does not ex
 
 ## Preserved original site
 
-The proxy currently forwards the original UI and API routes to:
+The proxy currently forwards the original UI and API routes to the immutable original production deployment:
 
-https://nova-source-archive-nov9.vercel.app/
+https://nova-ai-pgesffzzq-rawalvedant455-7308s-projects.vercel.app/
 
-Keep this archive deployment and alias available until the original full source project has been restored into this repository.
+The Vercel project keeps preview deployments protected. This original production snapshot remains the stable upstream until the complete original source project has been restored into this repository.
