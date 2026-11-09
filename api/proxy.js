@@ -1,4 +1,4 @@
-const UPSTREAM = 'https://nova-source-archive-nov9.vercel.app';
+const UPSTREAM = 'https://nova-ai-pgesffzzq-rawalvedant455-7308s-projects.vercel.app';
 
 module.exports = async function handler(req, res) {
   try {
@@ -52,13 +52,14 @@ module.exports = async function handler(req, res) {
       const value = upstream.headers.get(key);
       if (value) res.setHeader(key, value);
     }
-    res.setHeader('X-NOVA-Source', 'preserved');
+    res.setHeader('X-NOVA-Source', 'original-production-deployment');
     if (req.method === 'HEAD') return res.end();
     return res.end(body);
   } catch (error) {
+    console.error('NOVA upstream proxy failed:', error?.name || 'Error', error?.message || 'unknown');
     return res.status(502).json({
       error: 'NOVA source proxy failed',
-      message: 'The original site remains preserved at https://nova-source-archive-nov9.vercel.app/.'
+      message: 'The original site is preserved at its immutable deployment origin.'
     });
   }
 };
