@@ -34,11 +34,12 @@ module.exports = async function handler(req, res) {
       videoEmbeddable: 'true',
       videoSyndicated: 'true',
       safeSearch: 'moderate',
-      regionCode: 'IN',
-      key: apiKey
+      regionCode: 'IN'
     }).toString();
 
-    const searchResponse = await fetch(searchUrl);
+    const searchResponse = await fetch(searchUrl, {
+      headers: { 'x-goog-api-key': apiKey }
+    });
     const searchData = await searchResponse.json();
     if (!searchResponse.ok) {
       const reason = searchData?.error?.errors?.[0]?.reason || 'youtube_api_error';
@@ -64,11 +65,12 @@ module.exports = async function handler(req, res) {
       const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
       detailsUrl.search = new URLSearchParams({
         part: 'contentDetails,status',
-        id: ids.join(','),
-        key: apiKey
+        id: ids.join(',')
       }).toString();
 
-      const detailsResponse = await fetch(detailsUrl);
+      const detailsResponse = await fetch(detailsUrl, {
+        headers: { 'x-goog-api-key': apiKey }
+      });
       if (detailsResponse.ok) {
         const detailsData = await detailsResponse.json();
         for (const video of detailsData.items || []) videoDetails[video.id] = video;
