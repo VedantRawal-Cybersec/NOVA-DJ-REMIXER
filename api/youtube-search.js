@@ -19,7 +19,7 @@ module.exports = async function handler(req, res) {
     return send(res, 503, {
       setupRequired: true,
       error: 'YouTube search is not configured.',
-      message: 'Add YOUTUBE_API_KEY to this Vercel project’s Production environment. Pasted YouTube links can still be played in the embedded player.'
+      message: 'YOUTUBE_API_KEY is missing from the Vercel Production environment.'
     });
   }
 
@@ -40,12 +40,16 @@ module.exports = async function handler(req, res) {
     const searchResponse = await fetch(searchUrl);
     const searchData = await searchResponse.json();
     if (!searchResponse.ok) {
-      const reason = searchData?.error?.errors?.[0]?.reason;
+      const reason = searchData?.error?.errors?.[0]?.reason || 'youtube_api_error';
+      const providerMessage = searchData?.error?.message || 'Google rejected the YouTube Data API request.';
+      console.error('NOVA YouTube search rejected:', searchResponse.status, reason, providerMessage);
       return send(res, 502, {
         error: reason === 'quotaExceeded'
-          ? 'YouTube search quota has been reached. Try again later or review the Google Cloud quota.'
-          : 'YouTube search failed. Check the API key and YouTube Data API v3 restrictions.',
-        code: reason || 'youtube_api_error'
+          ? 'YouTube search quota has been reached. Review the Google Cloud quota.'
+          : 'YouTube rejected the search request. Check the Google Cloud API key and API restrictions.',
+        code: reason,
+        providerStatus: searchResponse.status,
+        providerMessage
       });
     }
 
@@ -65,6 +69,8 @@ module.exports = async function handler(req, res) {
       if (detailsResponse.ok) {
         const detailsData = await detailsResponse.json();
         for (const video of detailsData.items || []) videoDetails[video.id] = video;
+      } else {
+        console.error('NOVA YouTube video detail lookup failed:', detailsResponse.status);
       }
     }
 
@@ -102,8 +108,9 @@ module.exports = async function handler(req, res) {
       nextPageToken: searchData.nextPageToken || null
     }));
   } catch (error) {
+    console.error('NOVA YouTube search runtime failure:', error?.name || 'Error', error?.message || 'unknown');
     return send(res, 502, {
-      error: 'YouTube search is temporarily unavailable. Please try again.'
+      error: 'YouTube search is temporarily unavailable. Check the Vercel runtime log for NOVA YouTube search runtime failure.'
     });
   }
 };
