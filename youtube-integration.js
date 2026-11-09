@@ -270,7 +270,7 @@
         });
         const data = await response.json();
         if (!response.ok) {
-          status.textContent = data.message || data.error || 'YouTube search failed.';
+          status.textContent = (data.message || data.error || 'YouTube search failed.') + (data.providerMessage ? ' — ' + data.providerMessage : '');
           if (data.setupRequired) {
             results.appendChild(make('div', 'ny-empty', 'Paste a YouTube URL below to play now. In-app search needs the YOUTUBE_API_KEY Vercel Production environment variable.'));
           }
