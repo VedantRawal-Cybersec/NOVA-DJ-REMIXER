@@ -1,6 +1,9 @@
 import { getHarmonicMatch } from './camelot.js';
+import { TRANSITION_TYPES, planSetHeuristic } from './dj-brain.js';
 import { ProMixerEngine } from './pro-mixer-engine.js';
 import { YouTubeDeckEngine } from './youtube-deck-engine.js';
+
+export { planSetHeuristic };
 
 /**
  * Generates deterministic 88-bar visual waveform heat when a track hasn't
@@ -136,9 +139,12 @@ export class NovaOrchestrator {
 
     this.vibe = 'peak';
     this.playMode = 'club';
+    this.recipes = [];
+    this.appliedRecipes = [];
     this.ytCrossfadeSec = 5.5;
     this.ytTransitionStyle = 'phrase'; // phrase | sweep_cut | drum_bridge | echo_drop
     this.ytFxEnabled = true;
+    this.clickTrackEnabled = false;
     this.running = false;
     this.paused = false;
     this.crossfading = false;
@@ -154,13 +160,16 @@ export class NovaOrchestrator {
     return Boolean(track && (track.file || (track.dspReady && track.streamUrl)));
   }
 
-  async startSet(tracks, { vibe = 'peak', playMode = 'club', ytCrossfadeSec = 5.5, ytTransitionStyle = 'phrase', ytFxEnabled = true } = {}) {
+  async startSet(tracks, { vibe = 'peak', playMode = 'club', recipes = [], ytCrossfadeSec = 5.5, ytTransitionStyle = 'phrase', ytFxEnabled = true } = {}) {
     this.stop(true);
     this.vibe = vibe;
     this.playMode = playMode;
+    this.recipes = Array.isArray(recipes) ? recipes.slice() : [];
+    this.appliedRecipes = [];
     this.ytCrossfadeSec = ytCrossfadeSec;
     this.ytTransitionStyle = ytTransitionStyle;
     this.ytFxEnabled = ytFxEnabled;
+    this.proMixer.clickTrackEnabled = this.clickTrackEnabled;
     this.queue = tracks.slice();
     this.nextIndex = 0;
     this.playedHistory = [];
@@ -329,6 +338,7 @@ export class NovaOrchestrator {
     if (liveSlot.engine === 'dsp') {
       liveSlot.position = this.proMixer.getDeckPosition(liveId);
       liveSlot.duration = liveSlot.track?.durationSec || liveSlot.duration;
+      this.proMixer.scheduleClickLookahead(liveId);
     } else if (liveSlot.engine === 'yt') {
       const p = this.ytEngine.getPosition(liveId);
       if (p) {
@@ -371,19 +381,41 @@ export class NovaOrchestrator {
     this.paused = false;
 
     if (outSlot.engine === 'dsp' && inSlot.engine === 'dsp') {
-      const plan = this.proMixer.planTransition(outId, inId, {
-        vibe: this.vibe,
-        playMode: this.playMode,
-        overrideStyle: styleOverride,
-      });
-      this.transitionPlan = plan;
-      this.#setAgent(
-        `MIXING (${plan.style.replace(/_/g, ' ')}) · ${plan.bars} BARS · ${plan.harmonic.relation.toUpperCase()}`
-      );
-      this.#emit();
+      const matchedRecipe = !styleOverride
+        ? this.recipes.find((r) => r.from === outSlot.track?.id && r.to === inSlot.track?.id)
+        : null;
 
-      const { endAt } = await this.proMixer.executeTransition(outId, inId, plan);
-      const waitMs = Math.max(300, (endAt - this.proMixer.ctx.currentTime) * 1000 + 120);
+      let waitEndAt;
+      if (matchedRecipe && TRANSITION_TYPES.includes(matchedRecipe.type)) {
+        this.transitionPlan = {
+          ...matchedRecipe,
+          style: matchedRecipe.type.toUpperCase(),
+          bars: matchedRecipe.length_bars,
+          harmonic: { relation: matchedRecipe.why || 'validated recipe' },
+        };
+        this.appliedRecipes.push(matchedRecipe);
+        this.#setAgent(
+          `MIXING (${matchedRecipe.type.replace(/_/g, ' ').toUpperCase()}) · ${matchedRecipe.length_bars} BARS · VALIDATED ✓`
+        );
+        this.#emit();
+        const res = await this.proMixer.executeRecipe(outId, inId, matchedRecipe);
+        waitEndAt = res.endAt;
+      } else {
+        const plan = this.proMixer.planTransition(outId, inId, {
+          vibe: this.vibe,
+          playMode: this.playMode,
+          overrideStyle: styleOverride,
+        });
+        this.transitionPlan = plan;
+        this.#setAgent(
+          `MIXING (${plan.style.replace(/_/g, ' ')}) · ${plan.bars} BARS · ${plan.harmonic.relation.toUpperCase()}`
+        );
+        this.#emit();
+        const res = await this.proMixer.executeTransition(outId, inId, plan);
+        waitEndAt = res.endAt;
+      }
+
+      const waitMs = Math.max(300, (waitEndAt - this.proMixer.ctx.currentTime) * 1000 + 140);
       await new Promise((r) => setTimeout(r, waitMs));
       await this.proMixer.stopDeck(outId);
       this.proMixer.masterBpm = (inSlot.track.bpm || 120) * (this.proMixer.decks[inId].rate || 1);
@@ -625,6 +657,40 @@ export class NovaOrchestrator {
     const slot = this.decks[this.liveDeckId];
     if (slot?.engine !== 'dsp') return false;
     return this.proMixer.toggleLoopBars(this.liveDeckId, 4);
+  }
+
+  setClickTrack(enabled) {
+    this.clickTrackEnabled = Boolean(enabled);
+    this.proMixer.clickTrackEnabled = this.clickTrackEnabled;
+    this.proMixer.lastScheduledBeatIdx = -1;
+    this.#emit();
+  }
+
+  async triggerSpinbackLive() {
+    const slot = this.decks[this.liveDeckId];
+    if (slot?.engine === 'dsp') {
+      await this.proMixer.triggerSpinback(this.liveDeckId);
+    }
+  }
+
+  async previewTransition(trackA, trackB, recipe) {
+    if (!this.#isDspTrack(trackA) || !this.#isDspTrack(trackB)) {
+      throw new Error('Transition preview requires local files or Audius Full-DSP tracks.');
+    }
+    this.stop(true);
+    await this.proMixer.ensureContext();
+    const { analysis: a } = await this.proMixer.loadDeck('A', trackA, { gain: 1, playMode: this.playMode });
+    await this.proMixer.loadDeck('B', trackB, { gain: 0, playMode: this.playMode });
+    const barDur = (60 / Math.max(55, a.bpm || 120)) * 4;
+    const preBar = Math.max(0, (recipe.mix_out_bar || 4) - 2);
+    const startSec = a.bars?.[preBar]?.start_sec ?? preBar * barDur;
+    await this.proMixer.playDeck('A', { offsetSec: Math.min(a.durationSec - 6, startSec), rate: 1, gain: 1 });
+    await new Promise((r) => setTimeout(r, Math.round(Math.min(3500, barDur * 2000))));
+    const { endAt } = await this.proMixer.executeRecipe('A', 'B', recipe);
+    const waitMs = Math.max(500, (endAt - this.proMixer.ctx.currentTime) * 1000 + 800);
+    await new Promise((r) => setTimeout(r, Math.min(10000, waitMs)));
+    this.proMixer.stopDeck('A');
+    this.proMixer.stopDeck('B');
   }
 
   stop(silent = false) {

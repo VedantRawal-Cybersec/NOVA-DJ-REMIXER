@@ -1,4 +1,14 @@
 import { buildFallbackHeat, NovaOrchestrator, sequenceCrate } from '/js/engine/orchestrator.js';
+import {
+  buildRecipeFromCandidate,
+  normalizeSongAnalysis,
+  planSetHeuristic,
+  repairOrFallbackRecipe,
+  scorePairCandidates,
+  validateTransitionRecipe,
+} from '/js/engine/dj-brain.js';
+import { exportMixToWav } from '/js/engine/offline-exporter.js';
+import { renderBrainModal, renderDebugModal } from '/js/ui/debug-studio.js';
 
 const root = document.getElementById('app');
 const ytHost = document.getElementById('yt-deck-host');
@@ -82,11 +92,21 @@ const state = {
   crate: [],
   selectedLanguages: [],
 
-  // Director Choices
+  // Director Choices & AI Brain Plan
   playMode: 'club',
   vibe: 'peak',
   crowd: 'medium',
   sequencedSet: [],
+  setPlan: null,
+  opusBusy: false,
+  opusKey: (() => { try { return sessionStorage.getItem('nova.opus.key') || ''; } catch { return ''; } })(),
+  debugModalOpen: false,
+  brainModalOpen: false,
+  exportBusy: false,
+  exportMsg: '',
+  previewBusyIdx: -1,
+  clickTrack: false,
+  ratingsMap: (() => { try { return JSON.parse(localStorage.getItem('nova.transition.ratings.v1') || '{}'); } catch { return {}; } })(),
 
   // Saved sets
   savedSets: [],
@@ -414,6 +434,7 @@ async function handleLocalFiles(files) {
       });
       const a = rec.analysis;
       Object.assign(track, {
+        analysis: a,
         durationSec: a.durationSec,
         bpm: a.bpm,
         key: a.key,
@@ -479,13 +500,77 @@ async function advanceFromStep0() {
   render();
 }
 
+function getFewShotFeedback() {
+  return Object.entries(state.ratingsMap || {}).slice(-6).map(([pair, rating]) => ({ pair, rating }));
+}
+
 function buildReviewSet() {
-  state.sequencedSet = sequenceCrate(state.crate, {
+  const ordered = sequenceCrate(state.crate, {
     vibe: state.vibe,
     playMode: state.playMode,
   });
+  state.sequencedSet = ordered;
+  state.setPlan = planSetHeuristic(ordered, { vibe: state.vibe, playMode: state.playMode });
   state.screen = 'review';
   render();
+
+  // If Claude Opus API key is configured on server or in sessionStorage, upgrade recipes with AI Brain + Validator
+  if (ordered.length >= 2 && (state.health?.opusConfigured || state.opusKey)) {
+    state.opusBusy = true;
+    fetch('/api/plan', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(state.opusKey ? { 'x-anthropic-key': state.opusKey } : {}),
+      },
+      body: JSON.stringify({
+        songs: state.setPlan.analyses,
+        brief: { vibe: state.vibe, playMode: state.playMode, crowd: state.crowd },
+        fewShotExamples: getFewShotFeedback(),
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.ok && data.plan?.transitions?.length) {
+          state.setPlan = data.plan;
+          if (Array.isArray(data.plan.order)) {
+            const byId = {};
+            for (const t of state.sequencedSet) byId[t.id] = t;
+            const reordered = data.plan.order.map((id) => byId[id]).filter(Boolean);
+            if (reordered.length === state.sequencedSet.length) state.sequencedSet = reordered;
+          }
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        state.opusBusy = false;
+        if (state.screen === 'review' || state.debugModalOpen) render();
+      });
+  }
+}
+
+async function runOfflineWavExport() {
+  const tracks = state.sequencedSet.length ? state.sequencedSet : state.crate;
+  if (!tracks.length) return;
+  const orch = initOrchestrator();
+  state.exportBusy = true;
+  state.exportMsg = 'Preparing offline WAV mixdown…';
+  render();
+  try {
+    const res = await exportMixToWav(tracks, state.setPlan?.transitions || [], orch.proMixer, {
+      title: state.setNameInput || state.setPlan?.set_title || `NOVA-${state.vibe}-Mix`,
+      onProgress: (m) => {
+        state.exportMsg = m;
+        render();
+      },
+    });
+    state.exportMsg = `Exported ${Math.round(res.durationSec)}s studio WAV master (${(res.sizeBytes / (1024 * 1024)).toFixed(1)} MB) ✓`;
+  } catch (err) {
+    state.exportMsg = err?.message || 'WAV export failed.';
+  } finally {
+    state.exportBusy = false;
+    render();
+  }
 }
 
 async function approveAndPlay() {
@@ -498,11 +583,13 @@ async function approveAndPlay() {
   state.animatingSwap = false;
   state.sweepKey = 0;
   state.exitConfirm = false;
+  state.debugModalOpen = false;
   triggerCueHint();
   render();
   await orch.startSet(state.sequencedSet, {
     vibe: state.vibe,
     playMode: state.playMode,
+    recipes: state.setPlan?.transitions || [],
     ytCrossfadeSec: state.ytCrossfadeSec,
     ytTransitionStyle: state.ytTransitionStyle,
     ytFxEnabled: state.ytFxEnabled,
@@ -736,6 +823,7 @@ function renderWizard() {
     : '';
 
   const right = `
+    ${step === 0 ? `<button id="btn-open-brain" class="nav-meta-btn">BRAIN</button>` : ''}
     ${step === 0 ? `<button id="btn-open-sets" class="nav-meta-btn">MY SETS (${state.savedSets.length})</button>` : ''}
     ${dbBadge}
     <span class="step-counter">${step + 1} / 4</span>
@@ -877,6 +965,7 @@ function renderWizard() {
     ${floatingNext}
     ${state.setsModalOpen ? renderSetsModal() : ''}
     ${state.crateModalOpen ? renderCrateModal() : ''}
+    ${state.brainModalOpen ? renderBrainModal({ claudeKeySet: Boolean(state.opusKey), health: state.health }) : ''}
   `;
 
   bindWizardEvents();
@@ -941,20 +1030,32 @@ function renderReview() {
   const ytCount = state.sequencedSet.length - dspCount;
 
   const right = `
+    <button id="btn-open-debug" class="nav-meta-btn" style="color:var(--amber)">✦ RECIPES &amp; GRID</button>
     <button id="btn-review-back" class="nav-meta-btn">← CHANGE SETUP</button>
     ${renderExitBtn(false)}
   `;
+
+  const recipes = state.setPlan?.transitions || [];
+
+  const mins = Math.max(1, Math.round(totalSec / 60));
 
   root.innerHTML = `
     <main class="stage-shell">
       ${renderTopBar(right)}
       <h1 class="hero-h1" style="margin-top:4vh">TONIGHT'S SET</h1>
       <p class="hero-sub">
-        ${state.sequencedSet.length} songs · about ${Math.max(1, Math.round(totalSec / 60))} minutes ·
+        ${state.sequencedSet.length} songs · about ${mins} ${mins === 1 ? 'minute' : 'minutes'} ·
         <span class="text-accent">${esc(state.playMode.toUpperCase())}</span>
         ${dspCount ? ` · <span class="text-amber">${dspCount} FULL DSP</span>` : ''}
         ${ytCount ? ` · ${ytCount} YOUTUBE DECK` : ''}
+        ${state.setPlan?.validation?.valid ? ' · <span style="color:#6bff95">VALIDATOR ✓</span>' : ''}
       </p>
+
+      <div style="margin-top:16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <button id="btn-review-debug" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)">✦ INSPECT BEAT GRID &amp; RECIPES (${recipes.length})</button>
+        ${dspCount ? `<button id="btn-review-export" class="pill-btn squeeze" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'EXPORTING…' : '⬇ EXPORT MIX (.WAV)'}</button>` : ''}
+        ${state.exportMsg ? `<span style="font-size:13px;color:var(--amber)">${esc(state.exportMsg)}</span>` : ''}
+      </div>
 
       <ol class="review-list" id="review-list">
         ${state.sequencedSet.map((t, idx) => {
@@ -967,6 +1068,8 @@ function renderReview() {
           const cueLabel = t.playFull
             ? 'FULL'
             : `${fmtTime(t.entrySec || 0)}–${fmtTime(t.exitSec || t.durationSec || 180)}`;
+          const nextT = state.sequencedSet[idx + 1];
+          const rec = nextT ? recipes.find((r) => r.from === t.id && r.to === nextT.id) : null;
 
           return `
             <li class="review-row" data-song-idx="${idx}">
@@ -979,6 +1082,7 @@ function renderReview() {
                   <span class="row-tag ${isDsp ? '' : 'yt'}">${isDsp ? 'DSP · STEMS' : 'YT DECK'}</span>
                   ${t.bpm ? `<span class="font-mono-num" style="font-size:12px">${Math.round(t.bpm)} BPM</span>` : ''}
                   ${t.camelot ? `<span class="font-mono-num" style="font-size:12px;color:var(--amber)">${esc(t.camelot)}</span>` : ''}
+                  ${rec ? `<span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.6)">↳ ${esc(rec.type.replace(/_/g, ' ').toUpperCase())} (${Math.round((rec.compatibility?.score || 0.7) * 100)}%)</span>` : ''}
                 </div>
               </div>
               <div class="energy-meter" aria-label="Energy ${eVal} of 10">${bars}</div>
@@ -995,6 +1099,15 @@ function renderReview() {
         APPROVE &amp; PLAY
       </button>
     </div>
+    ${state.debugModalOpen ? renderDebugModal({
+      plan: state.setPlan,
+      tracks: state.sequencedSet,
+      opusBusy: state.opusBusy,
+      exportBusy: state.exportBusy,
+      exportMsg: state.exportMsg,
+      previewBusyIdx: state.previewBusyIdx,
+      ratingsMap: state.ratingsMap,
+    }) : ''}
   `;
 
   bindReviewEvents();
@@ -1159,8 +1272,16 @@ function renderProDrawer() {
             <button id="btn-loop-4" class="pill-btn squeeze ${state.loopActive ? 'active' : ''}">4-BAR LOOP ${state.loopActive ? 'ON' : 'OFF'}</button>
             <button id="btn-master-tempo" class="pill-btn squeeze ${state.masterTempo ? 'active' : ''}">MASTER TEMPO ${state.masterTempo ? 'ON' : 'OFF'}</button>
             <button id="btn-drum-bridge" class="pill-btn squeeze ${state.percussionBridge ? 'active' : ''}">DHOL / DRUM BRIDGE</button>
+            <button id="btn-click-track" class="pill-btn squeeze ${state.clickTrack ? 'active' : ''}">CLICK TRACK ${state.clickTrack ? 'ON' : 'OFF'}</button>
+            <button id="btn-spinback" class="pill-btn squeeze">⚡ SPINBACK</button>
             <button id="btn-record-mix" class="pill-btn squeeze ${state.recording ? 'active' : ''}">${state.recording ? '● STOP & SAVE MIX' : '● RECORD MIX'}</button>
           </div>
+
+          <div style="display:flex;flex-wrap:wrap;gap:8px;padding-top:4px">
+            <button id="btn-drawer-debug" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)">✦ BEAT GRID &amp; RECIPES</button>
+            <button id="btn-drawer-export" class="pill-btn squeeze" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'RENDERING WAV…' : '⬇ EXPORT MIX (.WAV)'}</button>
+          </div>
+          ${state.exportMsg ? `<div style="font-size:12px;color:var(--amber)">${esc(state.exportMsg)}</div>` : ''}
         ` : `
           <div style="display:flex;flex-direction:column;gap:14px">
             <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55)">YOUTUBE BLEND &amp; DECK CONSOLE</div>
@@ -1371,6 +1492,15 @@ function renderPlaying() {
     ${state.drawerOpen ? renderProDrawer() : ''}
     ${state.playNextModalOpen ? renderPlayNextModal() : ''}
     ${state.vibeModalOpen ? renderVibeModal() : ''}
+    ${state.debugModalOpen ? renderDebugModal({
+      plan: state.setPlan,
+      tracks: state.sequencedSet,
+      opusBusy: state.opusBusy,
+      exportBusy: state.exportBusy,
+      exportMsg: state.exportMsg,
+      previewBusyIdx: state.previewBusyIdx,
+      ratingsMap: state.ratingsMap,
+    }) : ''}
   `;
 
   bindPlayingEvents();
@@ -1379,30 +1509,67 @@ function renderPlaying() {
 
 function renderSummary() {
   const played = orchestrator?.playedHistory?.length ? orchestrator.playedHistory : state.sequencedSet;
+  const q = state.setPlan?.quality || { tempo_smoothness: 90, bass_clashes: 0, vocal_clashes: 0, energy_flow: 92 };
+  const recipes = state.setPlan?.transitions || [];
+  const dspCount = played.filter((t) => t.file || t.dspReady).length;
+
   root.innerHTML = `
     <main class="stage-shell">
       ${renderTopBar(`<button id="btn-summary-home" class="nav-meta-btn">NEW SET →</button>`)}
       <h1 class="hero-h1" style="margin-top:4vh">THAT WAS THE SET</h1>
-      <p class="hero-sub">${played.length} tracks played through NOVA AI DJ.</p>
+      <p class="hero-sub">${played.length} tracks played through NOVA AI DJ · <span class="text-amber">${esc(state.setPlan?.plannerSource || 'NOVA Engine')}</span></p>
 
-      <div class="ingest-box" style="margin-top:26px">
+      <div style="margin-top:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px">
+        <div style="border:2px solid rgba(245,245,240,0.14);border-radius:16px;padding:12px">
+          <div class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.5)">TEMPO SMOOTHNESS</div>
+          <div class="font-display text-accent" style="font-size:32px">${q.tempo_smoothness}%</div>
+        </div>
+        <div style="border:2px solid rgba(245,245,240,0.14);border-radius:16px;padding:12px">
+          <div class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.5)">BASS CLASHES</div>
+          <div class="font-display" style="font-size:32px;color:#6bff95">${q.bass_clashes}</div>
+        </div>
+        <div style="border:2px solid rgba(245,245,240,0.14);border-radius:16px;padding:12px">
+          <div class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.5)">VOCAL CLASHES</div>
+          <div class="font-display text-amber" style="font-size:32px">${q.vocal_clashes}</div>
+        </div>
+        <div style="border:2px solid rgba(245,245,240,0.14);border-radius:16px;padding:12px">
+          <div class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.5)">ENERGY FLOW</div>
+          <div class="font-display text-accent" style="font-size:32px">${q.energy_flow}%</div>
+        </div>
+      </div>
+
+      <div class="ingest-box" style="margin-top:20px">
         <div class="ingest-row">
           <input id="input-set-name" class="ingest-input" value="${esc(state.setNameInput)}" placeholder="Name this set (e.g. Friday Rooftop Mix)…" maxlength="60" />
           <button id="btn-save-set" class="ingest-btn squeeze">SAVE SET</button>
+          ${dspCount ? `<button id="btn-summary-export" class="ingest-btn ghost squeeze" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'RENDERING…' : '⬇ EXPORT .WAV'}</button>` : ''}
         </div>
         ${state.setSavedMsg ? `<div class="status-banner">${esc(state.setSavedMsg)}</div>` : ''}
+        ${state.exportMsg ? `<div class="status-banner">${esc(state.exportMsg)}</div>` : ''}
       </div>
 
       <ol class="review-list">
-        ${played.map((t, i) => `
-          <li class="review-row">
-            <span class="row-idx">${i + 1}</span>
-            <div class="row-main">
-              <div class="row-title">${esc(t.title)}</div>
-              <div class="row-meta">${esc(t.artist)}${t.bpm ? ` · ${Math.round(t.bpm)} BPM` : ''}</div>
-            </div>
-          </li>
-        `).join('')}
+        ${played.map((t, i) => {
+          const nextT = played[i + 1];
+          const rec = nextT ? recipes.find((r) => r.from === t.id && r.to === nextT.id) : null;
+          const rKey = rec ? `${rec.from}->${rec.to}` : '';
+          const rated = rKey ? state.ratingsMap[rKey] : '';
+          return `
+            <li class="review-row">
+              <span class="row-idx">${i + 1}</span>
+              <div class="row-main">
+                <div class="row-title">${esc(t.title)}</div>
+                <div class="row-meta">${esc(t.artist)}${t.bpm ? ` · ${Math.round(t.bpm)} BPM` : ''}${rec ? ` · ↳ ${esc(rec.type.replace(/_/g, ' ').toUpperCase())}` : ''}</div>
+              </div>
+              ${rec ? `
+                <div style="display:flex;gap:6px">
+                  <button class="pill-btn squeeze ${rated === 'good' ? 'active' : ''}" style="font-size:14px;padding:4px 10px" data-sum-rate="${esc(rKey)}" data-sum-val="good">👍</button>
+                  <button class="pill-btn squeeze ${rated === 'bad' ? 'active' : ''}" style="font-size:14px;padding:4px 10px" data-sum-rate="${esc(rKey)}" data-sum-val="bad">👎</button>
+                </div>
+              ` : ''}
+            </li>
+          `;
+        }).join('')}
       </ol>
     </main>
     <div class="sticky-approve-wrap">
@@ -1415,6 +1582,11 @@ function renderSummary() {
   document.getElementById('btn-summary-new').onclick = goHome;
   document.getElementById('input-set-name').oninput = (e) => { state.setNameInput = e.target.value; };
   document.getElementById('btn-save-set').onclick = () => saveCurrentSetToDb(state.setNameInput);
+  const sumExp = document.getElementById('btn-summary-export');
+  if (sumExp) sumExp.onclick = runOfflineWavExport;
+  document.querySelectorAll('[data-sum-rate]').forEach((b) => {
+    b.onclick = () => saveTransitionRating(b.dataset.sumRate, b.dataset.sumVal);
+  });
 }
 
 function goHome() {
@@ -1423,6 +1595,8 @@ function goHome() {
   state.screen = 'wizard';
   state.wizardStep = 0;
   state.drawerOpen = false;
+  state.debugModalOpen = false;
+  state.brainModalOpen = false;
   state.vibeModalOpen = false;
   state.playNextModalOpen = false;
   state.exitConfirm = false;
@@ -1460,6 +1634,24 @@ function bindWizardEvents() {
   const home = document.getElementById('btn-home');
   if (home) home.onclick = goHome;
   bindExitHandler(false);
+
+  const openBrain = document.getElementById('btn-open-brain');
+  if (openBrain) openBrain.onclick = () => { state.brainModalOpen = true; render(); };
+
+  if (state.brainModalOpen) {
+    document.getElementById('brain-backdrop').onclick = () => { state.brainModalOpen = false; render(); };
+    document.getElementById('btn-close-brain').onclick = () => { state.brainModalOpen = false; render(); };
+    document.getElementById('btn-save-opus-key').onclick = () => {
+      const val = document.getElementById('input-opus-key')?.value?.trim() || '';
+      state.opusKey = val;
+      try {
+        if (val) sessionStorage.setItem('nova.opus.key', val);
+        else sessionStorage.removeItem('nova.opus.key');
+      } catch {}
+      state.brainModalOpen = false;
+      render();
+    };
+  }
 
   const openSets = document.getElementById('btn-open-sets');
   if (openSets) openSets.onclick = () => { state.setsModalOpen = true; render(); };
@@ -1596,6 +1788,92 @@ function bindWizardEvents() {
   }
 }
 
+function saveTransitionRating(rKey, val) {
+  if (!rKey) return;
+  state.ratingsMap[rKey] = val;
+  try {
+    localStorage.setItem('nova.transition.ratings.v1', JSON.stringify(state.ratingsMap));
+  } catch {}
+  const [fromSongId, toSongId] = rKey.split('->');
+  fetch('/api/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'rate_transition',
+      sessionId: state.sessionId,
+      fromSongId,
+      toSongId,
+      rating: val,
+    }),
+  }).catch(() => {});
+  render();
+}
+
+function bindDebugModalEvents() {
+  if (!state.debugModalOpen) return;
+  const backdrop = document.getElementById('debug-backdrop');
+  if (backdrop) backdrop.onclick = () => { state.debugModalOpen = false; render(); };
+  const closeBtn = document.getElementById('btn-close-debug');
+  if (closeBtn) closeBtn.onclick = () => { state.debugModalOpen = false; render(); };
+  const expBtn = document.getElementById('btn-export-wav-debug');
+  if (expBtn) expBtn.onclick = runOfflineWavExport;
+
+  document.querySelectorAll('[data-preview-rec]').forEach((b) => {
+    b.onclick = async () => {
+      const idx = Number(b.dataset.previewRec);
+      const rec = state.setPlan?.transitions?.[idx];
+      if (!rec) return;
+      const trackA = state.sequencedSet.find((t) => t.id === rec.from);
+      const trackB = state.sequencedSet.find((t) => t.id === rec.to);
+      if (!trackA || !trackB) return;
+      state.previewBusyIdx = idx;
+      render();
+      try {
+        await initOrchestrator().previewTransition(trackA, trackB, rec);
+      } catch (err) {
+        state.exportMsg = err?.message || 'Preview unavailable';
+      } finally {
+        state.previewBusyIdx = -1;
+        render();
+      }
+    };
+  });
+
+  document.querySelectorAll('[data-regen-rec]').forEach((b) => {
+    b.onclick = () => {
+      const idx = Number(b.dataset.regenRec);
+      const cur = state.setPlan?.transitions?.[idx];
+      if (!cur) return;
+      const a = state.setPlan.analyses.find((x) => x.song_id === cur.from);
+      const bSong = state.setPlan.analyses.find((x) => x.song_id === cur.to);
+      if (!a || !bSong) return;
+      const cands = cur.candidates || scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode }).candidates;
+      const styles = ['bass_swap_blend', 'long_blend', 'filter_sweep', 'drum_loop_bridge', 'build_up_drop', 'echo_out', 'reverb_wash'];
+      const curStyleIdx = styles.indexOf(cur.type);
+      const nextStyle = styles[(curStyleIdx + 1) % styles.length];
+      let regenerated = buildRecipeFromCandidate(a, bSong, cands[0], nextStyle);
+      const v = validateTransitionRecipe(regenerated, a, bSong);
+      if (!v.valid) {
+        regenerated = buildRecipeFromCandidate(a, bSong, cands[(idx + 1) % cands.length]);
+      }
+      regenerated.validation = validateTransitionRecipe(regenerated, a, bSong);
+      regenerated.candidates = cands;
+      state.setPlan.transitions[idx] = regenerated;
+      if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
+      render();
+    };
+  });
+
+  document.querySelectorAll('[data-rate-rec]').forEach((b) => {
+    b.onclick = () => {
+      const idx = Number(b.dataset.rateRec);
+      const rec = state.setPlan?.transitions?.[idx];
+      if (!rec) return;
+      saveTransitionRating(`${rec.from}->${rec.to}`, b.dataset.rateVal);
+    };
+  });
+}
+
 function bindReviewEvents() {
   document.getElementById('btn-home').onclick = goHome;
   document.getElementById('btn-review-back').onclick = () => {
@@ -1604,11 +1882,41 @@ function bindReviewEvents() {
     render();
   };
   bindExitHandler(false);
+  const openDbg = document.getElementById('btn-open-debug');
+  if (openDbg) openDbg.onclick = () => { state.debugModalOpen = true; render(); };
+  const revDbg = document.getElementById('btn-review-debug');
+  if (revDbg) revDbg.onclick = () => { state.debugModalOpen = true; render(); };
+  const revExp = document.getElementById('btn-review-export');
+  if (revExp) revExp.onclick = runOfflineWavExport;
+  bindDebugModalEvents();
+
+  const syncPlanOrder = () => {
+    const analyses = state.sequencedSet.map((t) => normalizeSongAnalysis(t));
+    const transitions = [];
+    for (let i = 0; i < analyses.length - 1; i++) {
+      const a = analyses[i];
+      const bSong = analyses[i + 1];
+      const { candidates } = scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode });
+      let rec = buildRecipeFromCandidate(a, bSong, candidates[0]);
+      if (!validateTransitionRecipe(rec, a, bSong).valid) {
+        rec = repairOrFallbackRecipe(a, bSong, state.vibe, state.playMode);
+      }
+      rec.validation = validateTransitionRecipe(rec, a, bSong);
+      rec.candidates = candidates;
+      transitions.push(rec);
+    }
+    if (state.setPlan) {
+      state.setPlan.order = analyses.map((a) => a.song_id);
+      state.setPlan.analyses = analyses;
+      state.setPlan.transitions = transitions;
+    }
+  };
 
   document.querySelectorAll('[data-remove-idx]').forEach((b) => {
     b.onclick = () => {
       const idx = Number(b.dataset.removeIdx);
       state.sequencedSet.splice(idx, 1);
+      syncPlanOrder();
       render();
     };
   });
@@ -1649,6 +1957,7 @@ function bindReviewEvents() {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
         window.removeEventListener('pointercancel', onUp);
+        syncPlanOrder();
         render();
       };
 
@@ -1787,6 +2096,28 @@ function bindPlayingEvents() {
       orchestrator.proMixer.drumBridgeEnabled = state.percussionBridge;
       render();
     };
+
+    const clickBtn = document.getElementById('btn-click-track');
+    if (clickBtn) clickBtn.onclick = () => {
+      state.clickTrack = !state.clickTrack;
+      orchestrator.setClickTrack(state.clickTrack);
+      render();
+    };
+
+    const spinBtn = document.getElementById('btn-spinback');
+    if (spinBtn) spinBtn.onclick = () => {
+      orchestrator.triggerSpinbackLive();
+    };
+
+    const drawerDbg = document.getElementById('btn-drawer-debug');
+    if (drawerDbg) drawerDbg.onclick = () => {
+      state.drawerOpen = false;
+      state.debugModalOpen = true;
+      render();
+    };
+
+    const drawerExp = document.getElementById('btn-drawer-export');
+    if (drawerExp) drawerExp.onclick = runOfflineWavExport;
 
     const recBtn = document.getElementById('btn-record-mix');
     if (recBtn) recBtn.onclick = () => {
@@ -1927,6 +2258,8 @@ function bindPlayingEvents() {
       render();
     };
   }
+
+  bindDebugModalEvents();
 }
 
 function render() {

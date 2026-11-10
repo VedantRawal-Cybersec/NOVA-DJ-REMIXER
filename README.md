@@ -1,36 +1,37 @@
-# NOVA AI DJ v2 (Supernova Edition)
+# NOVA AI DJ v3 (Supernova Edition)
 
-NOVA is an autonomous browser & dual-deck AI DJ mixing studio styled around brutalist high-contrast performance clarity (`Anton` + `Inter`, Obsidian `#060608` + Supernova Vermilion `#FF4D00` + Solar Amber `#FFB800`).
+NOVA is a full-stack autonomous AI DJ, beatmatching engine, stem mashup studio, and YouTube playlist mixer styled around high-contrast performance clarity (`Obsidian #060608` + `Supernova Vermilion #FF4D00` + `Solar Amber #FFB800`).
 
-## Architecture
+## Architecture (Phases 1–7)
 
-### Dual-Path Hybrid Mixing Engine
-1. **Pro Web Audio DSP Engine (`public/js/engine/pro-mixer-engine.js`)** — runs on local audio uploads (`MP3`, `WAV`, `FLAC`, `M4A`, `OGG`) and full CORS-enabled streams (**Audius**, **Openverse**):
-   - **Essentia.js WASM Web Worker (`analysis-worker.js`)**: `RhythmExtractor2013` + `KeyExtractor` at `44.1 kHz`, sub-beat downbeat phase finder, 64-window section & drop segmentation, LUFS loudness measurement, and 88-bar waveform heat.
-   - **Signalsmith Stretch WASM `AudioWorklet`**: Pitch-preserving tempo stretch (*Master Tempo*) + automatic `±1` semitone Camelot harmonic key-lock (`camelot.js`) + quantized 4-bar looping.
-   - **Studio-Transparent 4-Band Isolator (`stems-isolator.js`)**: Zero-latency real-time stem controls (`Vocals`, `Drums`, `Bass`, `Air`) + sweepable HPF/LPF color filter, tempo-synced ping-pong echo, algorithmic reverb, synthesized percussion bridge, and live `.webm` mix recording.
-   - **8 Club Transition Choreographies**: `BASS_SWAP_16BAR`, `STEM_VOCAL_PASS`, `DROP_SWAP`, `TENSION_ROLL_DROP`, `ECHO_OUT_BRAKE`, `HARMONIC_BLEND`, `BREAKDOWN_BRIDGE`, `PERCUSSION_BRIDGE`.
-2. **Dual-Deck YouTube Engine (`public/js/engine/youtube-deck-engine.js`)** — runs on YouTube search results, single links, and imported playlists:
-   - Imports full YouTube playlists (up to 150 tracks via Data API v3 or public continuation fallback) and searches embeddable music videos seamlessly even when `YOUTUBE_API_KEY` is omitted or invalid.
-   - Dual pre-cued YouTube IFrame decks (`yt-deck-A` / `yt-deck-B`) with 4 blend modes (`PHRASE BLEND`, `SWEEP CUT`, `DRUM BRIDGE`, `ECHO DROP`), synchronized Web Audio transition FX accents, optional PIP video preview, and interactive drag-to-seek cue learning.
-
-### Database Persistence (`api/_lib/db.js`)
-Auto-detects connected Vercel database integrations across custom Marketplace prefixes without extra setup:
-- **Postgres** (`POSTGRES_URL`, `DATABASE_URL`, `NEON_DATABASE_URL`, `POSTGRES_PRISMA_URL`, `DATABASE_URL_POOLED`, `*_POSTGRES_URL`, `*_DATABASE_URL`) with auto-created tables (`nova_tracks`, `nova_playlists`, `nova_sets`, `nova_cue_feedback`)
-- **Supabase REST** (`SUPABASE_URL` / `*_SUPABASE_URL` + key)
-- **Vercel KV / Upstash Redis** (`KV_REST_API_URL` / `UPSTASH_REDIS_REST_URL` + token)
-- **Turso / libSQL** (`TURSO_DATABASE_URL` / `LIBSQL_URL` + auth token)
-- Falls back gracefully to browser `localStorage` for sets and learned cues when running offline.
+1. **Phase 1 — Measurement & Analysis Layer**
+   - **Browser Essentia.js WASM + Mid-Side Spectral Engine (`public/js/engine/analysis-worker.js`)**: Computes BPM, `beat_times`, `downbeat_times`, `bar_count`, `bars`, `phrase_boundaries` (8/16/32), `sections` (`intro`, `verse`, `build`, `chorus`, `bridge`, `outro`), `key_camelot`, `energy_per_bar`, `stem_activity` (`vocals`, `drums`, `bass`, `other`), `instrumental_gaps`, `tags`, and `warnings` (`no_clear_beat`, `free_time_intro`, `variable_tempo`, `low_confidence`).
+   - **Optional Python FastAPI GPU Backend (`backend/`)**: SHA-256 cached Demucs (`htdemucs`) 4-stem separation, multi-tracker beat/downbeat detection (`beat_this`, `madmom`, `librosa`), multilingual vocal-stem lyrics (`WhisperX` / `faster-whisper`), and Vercel proxy (`api/analyze.js` via `AUDIO_WORKER_URL`).
+2. **Phase 2 & 3 — Compatibility Scorer, AI Brain & Deterministic Validator (`public/js/engine/dj-brain.js`, `api/plan.js`)**
+   - Scores every candidate pair and 5 mix-point options via:
+     `S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R`
+   - Calls Anthropic **Claude Opus** (`ANTHROPIC_API_KEY` or session-only Studio key) with top 5 candidates, genre playbooks (Punjabi/Bhangra, Bollywood, Tamil/Telugu, Hip-Hop/Trap, House/Techno, Pop, R&B), and past user transition ratings — falling back seamlessly to deterministic TSP planning if no key is configured.
+   - Strict deterministic rule validator enforces bar bounds, `<= 8%` stretch (or half/double-time), `+-2` semitone cap, no overlapping lead vocals, no double basslines, Camelot distance `<= 1` on layered melodic stems, and safe transitions for warned tracks (with automatic retry + fallback).
+3. **Phase 4 & 5 — Web Audio Lookahead Engine & 14 Club Transitions (`public/js/engine/pro-mixer-engine.js`, `stems-isolator.js`, `offline-exporter.js`)**
+   - Bit-transparent Mid-Side matrix (`Mid = (L+R)/2`, `Side = (L-R)/2`) + 4-band stem isolator + 3-band kill EQ + color filter + tempo-synced ping-pong echo + reverb + master limiter.
+   - `SignalsmithStretch` WASM `AudioWorklet` for pitch-preserving beatmatching & 4-bar loops/loop-rolls/spinbacks.
+   - All 14 transition templates (`bass_swap_blend`, `long_blend`, `filter_sweep`, `echo_out`, `reverb_wash`, `drum_loop_bridge`, `loop_roll_drop`, `build_up_drop`, `vocal_mashup`, `acapella_in`, `instrumental_in`, `half_time_switch`, `impact_cut`, `spinback`) + synthesized Dhol/House/Trap drum bridges.
+   - Live beat-grid **Click Track** overlay + **OfflineAudioContext `.WAV` Mix Exporter** (`offline-exporter.js`).
+   - Dual-Deck YouTube engine (`youtube-deck-engine.js`) with public playlist continuation pagination (`api/_lib/youtube.js`) and 4 YouTube blend modes.
+4. **Phase 6 & 7 — Recipe Debug Studio & Quality Feedback Loop (`public/js/ui/debug-studio.js`)**
+   - Interactive beat-grid/section/gap SVG visualizer, 8s transition previewer, recipe regenerator, 👍/👎 transition ratings, set quality scorecard, and Postgres/Supabase/KV/Turso persistence (`api/_lib/db.js`).
 
 ## Commands
 
 ```bash
 npm install
-npm run build   # Copies Essentia.js & Signalsmith Stretch WASM bundles to public/vendor/
+npm run build   # Syncs Essentia.js & Signalsmith Stretch WASM bundles to public/vendor/
 npm run check   # Runs Node syntax validation across api/, scripts/, and public/js/
-npm run dev     # Starts local static + serverless API dev server on http://127.0.0.1:4173
+npm run dev     # Starts local dev server on http://127.0.0.1:4173
 ```
 
-## Vercel Environment Variables
-- `YOUTUBE_API_KEY` — YouTube Data API v3 key for search & playlist import.
-- Database env vars (`POSTGRES_URL` / `DATABASE_URL` / `SUPABASE_URL` / `KV_REST_API_URL`) — auto-detected by `api/_lib/db.js`.
+## Optional Vercel Environment Variables
+- `YOUTUBE_API_KEY` — YouTube Data API v3 key (public extractor works as fallback).
+- `ANTHROPIC_API_KEY` — Enables Claude Opus recipe generation in `/api/plan`.
+- `AUDIO_WORKER_URL` — URL to deployed `backend/` FastAPI Demucs/WhisperX service.
+- `POSTGRES_URL` / `DATABASE_URL` / `SUPABASE_URL` / `KV_REST_API_URL` / `TURSO_DATABASE_URL` — Cloud DB persistence (browser `localStorage` works offline).

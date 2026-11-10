@@ -10,10 +10,11 @@ export default async function handler(req, res) {
 
   return sendJson(res, 200, {
     ok: true,
-    service: 'NOVA AI DJ v2',
-    version: 'supernova-2.1',
+    service: 'NOVA AI DJ v3',
+    version: 'supernova-3.0',
     youtubeConfigured: Boolean(ytKey),
     youtubeMode: validYtKey ? 'data-api-v3+public-fallback' : 'public-extractor',
+    opusConfigured: Boolean(process.env.ANTHROPIC_API_KEY),
     audioWorkerConfigured: Boolean(process.env.AUDIO_WORKER_URL),
     database: db,
     capabilities: [

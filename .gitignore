@@ -1,7 +1,9 @@
 node_modules/
 .vercel/
-.DS_Store
-*.log
 public/vendor/
 .env
-.env.local
+.env.*
+backend/cache/
+__pycache__/
+*.pyc
+.DS_Store

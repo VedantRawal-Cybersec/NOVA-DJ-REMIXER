@@ -1,6 +1,14 @@
 import { getHarmonicMatch } from './camelot.js';
 import { createStemChannelStrip } from './stems-isolator.js';
 
+function clampRecipeRate(rate, recipeType) {
+  if (!Number.isFinite(rate) || rate <= 0) return 1;
+  if (recipeType === 'echo_out' || recipeType === 'impact_cut' || recipeType === 'spinback') {
+    return Math.max(0.88, Math.min(1.12, rate));
+  }
+  return Math.max(0.91, Math.min(1.09, rate));
+}
+
 let stretchModulePromise = null;
 async function loadSignalsmith() {
   if (!stretchModulePromise) {
@@ -39,6 +47,8 @@ export class ProMixerEngine {
     this.drumBridgeEnabled = false;
     this.masterTempoEnabled = true;
     this.autoKeyLockEnabled = true;
+    this.clickTrackEnabled = false;
+    this.lastScheduledBeatIdx = -1;
 
     this.masterBpm = 120;
     this.recorderActive = false;
@@ -211,22 +221,30 @@ export class ProMixerEngine {
     const buffer = await this.ctx.decodeAudioData(bytes);
     if (buffer.duration < 10) throw new Error('Track is shorter than 10 seconds.');
 
-    onProgress?.(`Analyzing beatgrid, key & structure for ${track.title}…`);
+    onProgress?.(`Analyzing beatgrid, downbeats, stems & key for ${track.title}…`);
     const ch0 = buffer.getChannelData(0);
     let mono;
+    let side = null;
+    const transfers = [];
     if (buffer.numberOfChannels > 1) {
       const ch1 = buffer.getChannelData(1);
       mono = new Float32Array(ch0.length);
-      for (let i = 0; i < ch0.length; i++) mono[i] = 0.5 * (ch0[i] + ch1[i]);
+      side = new Float32Array(ch0.length);
+      for (let i = 0; i < ch0.length; i++) {
+        mono[i] = 0.5 * (ch0[i] + ch1[i]);
+        side[i] = 0.5 * (ch0[i] - ch1[i]);
+      }
+      transfers.push(mono.buffer, side.buffer);
     } else {
       mono = new Float32Array(ch0);
+      transfers.push(mono.buffer);
     }
 
     const worker = this.#ensureWorker();
     const reqId = ++this.workerReqId;
     const analysis = await new Promise((resolve, reject) => {
       this.workerPending.set(reqId, { resolve, reject });
-      worker.postMessage({ id: reqId, mono, sampleRate: buffer.sampleRate }, [mono.buffer]);
+      worker.postMessage({ id: reqId, mono, side, sampleRate: buffer.sampleRate }, transfers);
     });
 
     const record = { buffer, analysis };
@@ -684,7 +702,199 @@ export class ProMixerEngine {
     return { startAt, endAt };
   }
 
-  #schedulePercussionBridge(when, bpm, bars) {
+  /**
+   * Lookahead Beat-Grid Metronome Overlay (verifies detected beats & downbeats by ear)
+   */
+  scheduleClickLookahead(deckId) {
+    if (!this.clickTrackEnabled || !this.ctx) return;
+    const deck = this.decks[deckId];
+    if (!deck || !deck.playing || !deck.analysis?.beat_times?.length) return;
+    const pos = this.getDeckPosition(deckId);
+    const rate = Math.max(0.5, deck.rate || 1);
+    const lookAheadInputSec = 0.25 * rate;
+    const beats = deck.analysis.beat_times;
+    const dbs = new Set((deck.analysis.downbeat_times || []).map((t) => Math.round(t * 10)));
+
+    for (let i = 0; i < beats.length; i++) {
+      const bt = beats[i];
+      if (bt <= pos - 0.02 || bt > pos + lookAheadInputSec) continue;
+      if (i <= this.lastScheduledBeatIdx && Math.abs(i - this.lastScheduledBeatIdx) < 400) continue;
+      this.lastScheduledBeatIdx = i;
+      const at = this.ctx.currentTime + Math.max(0.01, (bt - pos) / rate);
+      const isDown = dbs.has(Math.round(bt * 10)) || i % 4 === 0;
+      const osc = this.ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(isDown ? 1580 : 940, at);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.linearRampToValueAtTime(isDown ? 0.24 : 0.12, at + 0.003);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + 0.055);
+      osc.connect(g);
+      g.connect(this.ctx.destination);
+      osc.start(at);
+      osc.stop(at + 0.065);
+    }
+  }
+
+  /**
+   * Executes a complete Phase 2/3 validated JSON transition recipe on AudioContext.currentTime.
+   * Supports all 14 Phase 5 templates + stem curves + 3-band EQ kills + spinback/stutter + genre drums.
+   */
+  async executeRecipe(outDeckId, inDeckId, recipe) {
+    const outDeck = this.decks[outDeckId];
+    const inDeck = this.decks[inDeckId];
+    if (!outDeck || !inDeck || !inDeck.buffer) return { startAt: this.ctx.currentTime, endAt: this.ctx.currentTime + 4 };
+
+    const now = this.ctx.currentTime;
+    const outPos = this.getDeckPosition(outDeckId);
+    const outBpm = (outDeck.analysis?.bpm || 120) * (outDeck.rate || 1);
+    const beatSec = 60 / Math.max(55, outBpm);
+    const barSec = beatSec * 4;
+
+    const grid = outDeck.analysis?.downbeat_times?.length ? outDeck.analysis.downbeat_times : outDeck.analysis?.beats || [];
+    let startAt = now + 0.16;
+    const nextBeat = grid.find((b) => b >= outPos + 0.16 && b <= outPos + barSec + 0.4);
+    if (nextBeat !== undefined) {
+      startAt = Math.max(now + 0.16, now + (nextBeat - outPos) / Math.max(0.5, outDeck.rate || 1));
+    }
+
+    const durBars = Math.max(2, Number(recipe.length_bars) || 16);
+    const rawDur = durBars * barSec;
+    const outRem = Math.max(3, (outDeck.buffer.duration - outPos) * 0.72);
+    const dur = Math.min(rawDur, Math.max(2.5, Math.min(36, outRem)));
+    const barUnit = dur / durBars;
+    const endAt = startAt + dur;
+
+    const stretchFrom = Number(recipe.tempo_plan?.stretch_from || inDeck.analysis?.bpm || outBpm);
+    const stretchTo = Number(recipe.tempo_plan?.stretch_to || outBpm);
+    let rate = outBpm / Math.max(55, stretchFrom);
+    if (Math.abs(rate - 2.0) < 0.16) rate *= 0.5;
+    else if (Math.abs(rate - 0.5) < 0.08) rate *= 2.0;
+    const safeRate = clampRecipeRate(rate, recipe.type);
+    const semitones = Math.max(-2, Math.min(2, Number(recipe.tempo_plan?.pitch_shift_semitones || 0)));
+
+    // Compute exact Bar 1 downbeat entry on Deck B from mix_in_bar
+    const inBarObj = inDeck.analysis?.bars?.[recipe.mix_in_bar];
+    const inOffset = inBarObj ? inBarObj.start_sec : Math.max(0, (recipe.mix_in_bar || 0) * (240 / Math.max(55, stretchFrom)));
+
+    this.echoDelayL.delayTime.setValueAtTime(beatSec * 0.5, startAt);
+    this.echoDelayR.delayTime.setValueAtTime(beatSec * 0.75, startAt);
+
+    await this.playDeck(inDeckId, {
+      offsetSec: Math.min(inDeck.buffer.duration - 2, inOffset),
+      rate: safeRate,
+      semitones,
+      when: startAt,
+      gain: 0.001,
+    });
+
+    const outGain = outDeck.strip.deckVolume.gain;
+    const inGain = inDeck.strip.deckVolume.gain;
+    outGain.cancelScheduledValues(startAt);
+    inGain.cancelScheduledValues(startAt);
+
+    // Apply stem_layers gain automation curves
+    const applyDeckCurve = (deck, songId, defStartGain, defEndGain) => {
+      const volParam = deck.strip.deckVolume.gain;
+      const allLayer = (recipe.stem_layers || []).find((s) => s.song === songId && s.stem === 'all');
+      if (allLayer?.gain_curve?.length) {
+        volParam.setValueAtTime(Math.max(0.0001, allLayer.gain_curve[0][1]), startAt);
+        for (const [b, g] of allLayer.gain_curve) {
+          const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
+          volParam.linearRampToValueAtTime(Math.max(0.0001, Math.min(1.15, g)), at);
+        }
+      } else {
+        volParam.setValueAtTime(defStartGain, startAt);
+        volParam.linearRampToValueAtTime(defEndGain, endAt);
+      }
+
+      for (const layer of (recipe.stem_layers || []).filter((s) => s.song === songId && s.stem !== 'all')) {
+        if (!layer.gain_curve?.length) continue;
+        for (const [b, g] of layer.gain_curve) {
+          const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
+          deck.strip.setStem(layer.stem, g, at, 0.06);
+        }
+      }
+    };
+
+    applyDeckCurve(outDeck, outDeck.track?.id || recipe.from, 1.0, 0.0001);
+    applyDeckCurve(inDeck, inDeck.track?.id || recipe.to, 0.001, 1.0);
+
+    // Apply 3-band EQ automation points
+    for (const eq of recipe.eq_automation || []) {
+      const targetDeck = eq.deck === 'A' ? outDeck : inDeck;
+      if (!eq.points?.length) continue;
+      for (const [b, db] of eq.points) {
+        const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
+        targetDeck.strip.setEqBand(eq.band, db, at, 0.04);
+      }
+    }
+
+    // Apply filter automation points
+    for (const fl of recipe.filter_automation || []) {
+      const targetDeck = fl.deck === 'A' ? outDeck : inDeck;
+      for (const [b, val] of fl.curve || []) {
+        const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
+        targetDeck.strip.setColorFilter(val, at, 0.06);
+      }
+    }
+
+    // Apply FX events (echo, reverb, loop_roll, spinback, riser_impact, impact)
+    for (const fxItem of recipe.fx || []) {
+      const at = startAt + Math.max(0, Math.min(durBars, fxItem.start_bar || 0)) * barUnit;
+      if (fxItem.type === 'echo') {
+        const lvl = fxItem.params?.level ?? 0.5;
+        outDeck.strip.echoSend.gain.setValueAtTime(0, startAt);
+        outDeck.strip.echoSend.gain.linearRampToValueAtTime(lvl, at + dur * 0.45);
+        outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
+      } else if (fxItem.type === 'reverb') {
+        const lvl = fxItem.params?.level ?? 0.55;
+        outDeck.strip.reverbSend.gain.setValueAtTime(0, startAt);
+        outDeck.strip.reverbSend.gain.linearRampToValueAtTime(lvl, at + dur * 0.55);
+        outDeck.strip.reverbSend.gain.linearRampToValueAtTime(0, endAt);
+      } else if (fxItem.type === 'loop_roll' && outDeck.stretch) {
+        const anchor = outPos + (startAt - now) * Math.max(0.5, outDeck.rate);
+        outDeck.stretch.schedule({ output: at, outputTime: at, loopStart: Math.max(0, anchor - beatSec * 2), loopEnd: Math.max(0.2, anchor) });
+        const halfAt = at + dur * 0.45;
+        outDeck.stretch.schedule({ output: halfAt, outputTime: halfAt, loopStart: Math.max(0, anchor - beatSec), loopEnd: Math.max(0.1, anchor) });
+      } else if (fxItem.type === 'spinback' && outDeck.stretch) {
+        const steps = 6;
+        for (let s = 0; s < steps; s++) {
+          const stAt = at + (s / steps) * 0.85;
+          outDeck.stretch.schedule({ output: stAt, outputTime: stAt, rate: 1 - (s / steps) * 0.72, semitones: -s * 2 });
+        }
+      } else if (fxItem.type === 'riser_impact' || fxItem.type === 'impact') {
+        this.playTransitionSweepFx({ type: 'sweep_cut', bpm: outBpm, durationSec: Math.min(6, dur * 0.85) });
+      }
+    }
+
+    // Apply genre-matched added_drums bridge (Dhol / House / Trap)
+    if (recipe.added_drums) {
+      const style = recipe.added_drums.style || 'house';
+      const drGain = Math.min(0.32, Number(recipe.added_drums.gain) || 0.22);
+      const drStart = startAt + Math.max(0, Number(recipe.added_drums.start_bar) || 0) * barUnit;
+      const drBars = Math.max(2, (Number(recipe.added_drums.end_bar) || durBars) - (Number(recipe.added_drums.start_bar) || 0));
+      this.#schedulePercussionBridge(drStart, outBpm, drBars, style, drGain);
+    }
+
+    return { startAt, endAt };
+  }
+
+  async triggerSpinback(deckId) {
+    const deck = this.decks[deckId];
+    if (!deck?.playing) return;
+    const now = this.ctx.currentTime + 0.02;
+    if (deck.stretch) {
+      for (let i = 0; i < 6; i++) {
+        const at = now + i * 0.11;
+        await deck.stretch.schedule({ output: at, outputTime: at, rate: Math.max(0.2, 1 - i * 0.16), semitones: -i * 2 });
+      }
+      const resAt = now + 0.72;
+      await deck.stretch.schedule({ output: resAt, outputTime: resAt, rate: deck.rate || 1, semitones: deck.semitones || 0 });
+    }
+  }
+
+  #schedulePercussionBridge(when, bpm, bars, style = 'house', peakGain = 0.22) {
     if (!this.ctx) return;
     const sr = this.ctx.sampleRate;
     if (!this.drumSamples) {
@@ -696,11 +906,13 @@ export class ProMixerEngine {
       };
       this.drumSamples = {
         kick: makeBuf(0.24, (t) => Math.sin(2 * Math.PI * (52 * t + 90 * (1 - Math.exp(-t * 28)) / 28)) * Math.exp(-t * 17)),
+        dholBass: makeBuf(0.28, (t) => Math.sin(2 * Math.PI * (68 * t + 75 * (1 - Math.exp(-t * 22)) / 22)) * Math.exp(-t * 12)),
+        dholRim: makeBuf(0.12, (t) => (Math.sin(2 * Math.PI * 520 * t) * 0.65 + (Math.random() * 2 - 1) * 0.35) * Math.exp(-t * 28)),
         snare: makeBuf(0.15, (t) => ((Math.random() * 2 - 1) * 0.68 + Math.sin(2 * Math.PI * 195 * t) * 0.32) * Math.exp(-t * 22)),
         hat: makeBuf(0.045, (t) => ((Math.random() * 2 - 1) * 0.6 + Math.sin(2 * Math.PI * 7400 * t) * 0.35) * Math.exp(-t * 82)),
       };
     }
-    const beat = 60 / Math.max(60, bpm);
+    const beat = 60 / Math.max(55, bpm);
     const totalBeats = Math.ceil(bars * 4);
     const hit = (buf, at, gainVal, hpFreq = 0) => {
       const src = this.ctx.createBufferSource();
@@ -724,9 +936,26 @@ export class ProMixerEngine {
     };
     for (let k = 0; k < totalBeats; k++) {
       const at = when + k * beat;
-      if (k % 2 === 0) hit(this.drumSamples.kick, at, k % 4 === 0 ? 0.22 : 0.14);
-      if (k % 4 === 1 || k % 4 === 3) hit(this.drumSamples.snare, at, 0.09, 240);
-      hit(this.drumSamples.hat, at + beat * 0.5, 0.04, 6200);
+      if (style === 'dhol') {
+        // Punjabi / Bhangra swing groove (chaal triplet pulse)
+        hit(this.drumSamples.dholBass, at, k % 4 === 0 ? peakGain : peakGain * 0.65);
+        hit(this.drumSamples.dholRim, at + beat * 0.33, peakGain * 0.45);
+        hit(this.drumSamples.dholRim, at + beat * 0.66, peakGain * 0.52);
+        if (k % 2 === 1) hit(this.drumSamples.dholBass, at + beat * 0.75, peakGain * 0.55);
+      } else if (style === 'trap') {
+        if (k % 4 === 0) hit(this.drumSamples.kick, at, peakGain);
+        if (k % 4 === 1) hit(this.drumSamples.kick, at + beat * 0.5, peakGain * 0.82);
+        if (k % 4 === 2) hit(this.drumSamples.snare, at, peakGain * 0.65, 220);
+        const subdiv = k % 4 === 3 ? 6 : 4;
+        for (let s = 0; s < subdiv; s++) {
+          hit(this.drumSamples.hat, at + (s * beat) / subdiv, peakGain * 0.25, 6500);
+        }
+      } else {
+        // House 4-on-floor + offbeat hat
+        hit(this.drumSamples.kick, at, k % 4 === 0 ? peakGain : peakGain * 0.78);
+        if (k % 2 === 1) hit(this.drumSamples.snare, at, peakGain * 0.42, 260);
+        hit(this.drumSamples.hat, at + beat * 0.5, peakGain * 0.22, 6200);
+      }
     }
   }
 

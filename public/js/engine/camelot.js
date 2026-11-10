@@ -54,6 +54,27 @@ export function parseCamelot(code) {
   return { num: Number(m[1]), letter: m[2] };
 }
 
+export function shiftCamelot(code, semitones = 0) {
+  const p = parseCamelot(code);
+  if (!p) return null;
+  const s = Math.round(Number(semitones) || 0);
+  if (s === 0) return code;
+  // +1 semitone = +7 on Camelot circle of fifths mod 12
+  const num = (((p.num - 1) + s * 7) % 12 + 12) % 12 + 1;
+  return `${num}${p.letter}`;
+}
+
+export function camelotDistance(camelotA, camelotB) {
+  const a = parseCamelot(camelotA);
+  const b = parseCamelot(camelotB);
+  if (!a || !b) return 99;
+  const raw = Math.abs(a.num - b.num);
+  const wheelDiff = Math.min(raw, 12 - raw);
+  if (a.letter === b.letter) return wheelDiff;
+  if (wheelDiff === 0) return 1; // relative major/minor (0 steps + letter swap = 1 step!)
+  return wheelDiff + 1;
+}
+
 export function getHarmonicMatch(camelotA, camelotB) {
   const a = parseCamelot(camelotA);
   const b = parseCamelot(camelotB);
