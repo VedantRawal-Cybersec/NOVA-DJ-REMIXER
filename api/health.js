@@ -1,0 +1,3 @@
+module.exports = (_req,res) => {
+  res.setHeader('Cache-Control','no-store');
+  res.status(200).json({status:'ok',service:'NOVA AI DJ',version:'nova-intelligence-1',features:['dual-deck-playback','tempo-aware-auto-director','phrase-aligned-crossfade','three-band-eq','master-echo-reverb-filter','four-bar-loop','unified-open-catalogue-search','preview-only-mainstream-discovery','metadata-only-recording-search','local-mix-feedback'],catalogue:...[truncated]

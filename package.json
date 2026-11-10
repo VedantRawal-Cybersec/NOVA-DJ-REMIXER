@@ -1,0 +1,13 @@
+{
+  "name": "nova-ai-dj",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/assemble-source.mjs",
+    "check:engine": "npm run build && node --check src/nova-audio-engine.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

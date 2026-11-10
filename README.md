@@ -1,31 +1,64 @@
 # NOVA AI DJ
 
-NOVA's current deployed experience is preserved behind a same-origin proxy to the archived original deployment. The YouTube layer is additive: it adds YouTube discovery, official embedded playback, and a local queue without routing YouTube audio into the DJ remix engine.
+NOVA is a browser-based DJ mixing workspace with a track catalogue, local audio uploads, a prompt/voice-driven set brief, and a Web Audio mixing engine.
 
-## YouTube integration
+## Restore and build
 
-- Official YouTube embedded player
-- Search through YouTube Data API v3
-- Search-result thumbnails, video titles, creator channels, and durations
-- Paste a YouTube video URL and play it inside NOVA
-- Local queue with add, play-next, remove, and clear controls
-- Search fallback link to YouTube
-- API key kept server-side in Vercel
+The complete homepage and standalone engine source are stored in `source/chunks/` as independent Brotli-compressed source parts. The repository build restores them into ordinary, readable files.
 
-## Required Vercel environment variable
+```bash
+npm run build
+```
 
-Set `YOUTUBE_API_KEY` in the Production environment. Create an API key in Google Cloud after enabling YouTube Data API v3, then restrict that key to YouTube Data API v3. Never place the key in browser JavaScript or commit it to Git.
+The build creates:
 
-The embedded player and pasted-link playback do not need the Data API key. In-app search does.
+- `public/index.html` — the complete NOVA website, including the current UI and inline browser application code.
+- `src/nova-audio-engine.js` — the standalone, readable audio-engine source.
 
-## Rights and playback boundaries
+The build uses Node.js built-in modules only. No third-party npm dependencies are required. Vercel is configured to run this build and publish `public/`.
 
-YouTube is used as a discovery and embedded playback source. The app does not extract, download, hide, or re-host YouTube audio. YouTube tracks are not passed into NOVA's audio mixing, EQ, beatmatching, or crossfade engine. Use only separately licensed or user-authorized audio files for DJ transformations.
+## Current application features
 
-## Preserved original site
+- Track catalogue discovery using supported public metadata and preview providers.
+- Local audio-file loading and decoding into browser `AudioBuffer` objects.
+- BPM estimation, onset/beat-grid analysis, downbeat confidence, energy curve and heuristic section estimation.
+- Mix-in and mix-out cue selection, including longer phrase-aware outgoing windows.
+- Playback-rate tempo matching between decks.
+- Web Audio scheduling against the audio context clock.
+- Automated transition planning with bass handover, three-band EQ, filters and echo.
+- Optional generated kick/snare/hat percussion layer.
+- Mix recording through the browser audio graph.
+- Prompt-driven and voice-input DJ set briefs where browser speech recognition is available.
 
-The proxy currently forwards the original UI and API routes to the immutable original production deployment:
+## API routes
 
-https://nova-ai-pgesffzzq-rawalvedant455-7308s-projects.vercel.app/
+- `/api/health` — health/status response.
+- `/api/catalogue` — catalogue search and supported provider aggregation.
+- `/api/proxy` — existing same-origin proxy retained from the original project.
+- `/api/youtube-search` — YouTube Data API search endpoint.
+- `youtube-integration.js` — existing YouTube embed/queue integration source.
 
-The Vercel project keeps preview deployments protected. This original production snapshot remains the stable upstream until the complete original source project has been restored into this repository.
+### YouTube configuration
+
+Set `YOUTUBE_API_KEY` in the Vercel Production environment after enabling YouTube Data API v3 in Google Cloud. Keep the key in Vercel environment variables; never place it in browser-side source code.
+
+YouTube playback remains through the official embedded player. It is not extracted or passed into the DJ audio transformation engine.
+
+## Technical boundaries
+
+- Beat grids, downbeats, sections, cue points and key indicators are browser-side estimates, not guaranteed ground truth.
+- When downbeat confidence is low, the engine falls back to beat-grid cues.
+- The current implementation does not include vocal/instrumental source separation, true stem extraction, lyric transcription, or a trained music-understanding model.
+- Browser decoding depends on the source being fetchable and CORS-permitted, or on the user uploading a local audio file.
+- Catalogue availability and preview length depend on provider APIs and licensing. This project does not grant rights to download, remix, distribute, or publicly perform third-party recordings.
+
+## Development
+
+Requirements: Node.js 20 or newer.
+
+```bash
+npm run build
+node --check src/nova-audio-engine.js
+```
+
+The Vercel build command is `npm run build`; the static output directory is `public`. Existing API and YouTube source files are retained in the repository.
