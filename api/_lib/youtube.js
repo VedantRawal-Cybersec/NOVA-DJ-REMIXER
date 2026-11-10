@@ -2,6 +2,15 @@ const JUNK_PARENS = /^(?:feat\.?|ft\.?|featuring|from|official|video|audio|lyric
 const LANG_ONLY_PARENS = /^(?:hindi|punjabi|english|tamil|telugu|gujarati|bhojpuri|haryanvi|marathi|bengali|kannada|malayalam)(?:\s*[+/&,]\s*(?:hindi|punjabi|english|tamil|telugu|gujarati|bhojpuri|haryanvi|marathi|bengali|kannada|malayalam))*(?:\s+(?:version|ver\.?))?$/i;
 const TRAILING_TAGS = /\s*(?:\||::|—|-)\s*(?:official\s+(?:music\s+)?(?:video|audio|song)|full\s+(?:video|song|audio)|lyrical(?:\s+video)?|t-series|zee music|yrf|sony music|tips official|speed records|saregama).*$/i;
 
+const PUBLIC_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+export function sanitizeApiKey(raw) {
+  return String(raw || '').trim().replace(/^["']|["']$/g, '');
+}
+
 export function cleanTrackMetadata(rawTitle, channelTitle = '') {
   const cleanedChannel = String(channelTitle || '')
     .replace(/\s*-\s*Topic$/i, '')
@@ -9,7 +18,7 @@ export function cleanTrackMetadata(rawTitle, channelTitle = '') {
     .replace(/\s*Official$/i, '')
     .trim();
 
-  let t = String(rawTitle || 'Untitled')
+  const t = String(rawTitle || 'Untitled')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
@@ -42,6 +51,15 @@ export function parseIsoDuration(iso) {
   const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
   if (!m) return 0;
   return (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0);
+}
+
+export function parseClockDuration(text) {
+  if (!text || typeof text !== 'string') return 0;
+  const parts = text.trim().split(':').map((n) => Number.parseInt(n, 10));
+  if (parts.some((n) => !Number.isFinite(n))) return 0;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return 0;
 }
 
 export function parseYouTubeInput(input) {
@@ -92,12 +110,48 @@ export function parseYouTubeInput(input) {
   return { kind: 'query', query: raw };
 }
 
+function makeTrack({ videoId, rawTitle, channelTitle, durationSec, artwork }) {
+  const { title, artist } = cleanTrackMetadata(rawTitle, channelTitle);
+  const safeDur = Math.max(30, Number(durationSec) || 210);
+  const defaultEntry = Math.min(Math.round(safeDur * 0.22), 45);
+  const defaultExit = Math.min(safeDur - 3, Math.max(defaultEntry + 42, Math.round(safeDur * 0.78)));
+
+  return {
+    id: `yt-${videoId}`,
+    videoId,
+    youtubeIds: [videoId],
+    source: 'youtube',
+    provider: 'YouTube',
+    playback: 'youtube-iframe',
+    mixReady: true,
+    dspReady: false,
+    title,
+    rawTitle: rawTitle || title,
+    artist,
+    channelTitle: channelTitle || 'YouTube',
+    artwork: artwork || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    durationSec: safeDur,
+    duration: safeDur,
+    entrySec: defaultEntry,
+    exitSec: defaultExit,
+    playFull: false,
+    bpm: null,
+    key: null,
+    camelot: null,
+    energy: 7,
+    heat: null,
+    cueVotes: 0,
+    cueConfidence: 'auto',
+    url: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+    landingUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+  };
+}
+
 async function fetchYtJson(endpoint, params, apiKey) {
+  const cleanKey = sanitizeApiKey(apiKey);
   const url = new URL(`https://www.googleapis.com/youtube/v3/${endpoint}`);
-  url.search = new URLSearchParams(params).toString();
-  const response = await fetch(url, {
-    headers: { 'x-goog-api-key': apiKey },
-  });
+  url.search = new URLSearchParams({ ...params, key: cleanKey }).toString();
+  const response = await fetch(url);
   const data = await response.json();
   if (!response.ok) {
     const reason = data?.error?.errors?.[0]?.reason || 'youtube_api_error';
@@ -127,58 +181,7 @@ export async function fetchVideoDetailsBatch(videoIds, apiKey) {
   return detailsMap;
 }
 
-function buildTrackRecord(videoId, snippet, details, cachedTrack) {
-  const durationSec = parseIsoDuration(details?.contentDetails?.duration || '') || cachedTrack?.durationSec || 210;
-  const thumbs = snippet?.thumbnails || details?.snippet?.thumbnails || {};
-  const artwork =
-    thumbs.maxres?.url ||
-    thumbs.high?.url ||
-    thumbs.medium?.url ||
-    thumbs.default?.url ||
-    `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
-  const { title, artist } = cleanTrackMetadata(
-    snippet?.title || details?.snippet?.title || 'Untitled',
-    snippet?.channelTitle || details?.snippet?.channelTitle || ''
-  );
-
-  // Smart default hook/cue estimate until Essentia/user drag refines it
-  const safeDur = Math.max(30, durationSec);
-  const defaultEntry = cachedTrack?.entrySec ?? Math.min(Math.round(safeDur * 0.22), 45);
-  const defaultExit = cachedTrack?.exitSec ?? Math.max(defaultEntry + 42, Math.round(safeDur * 0.78));
-
-  return {
-    id: `yt-${videoId}`,
-    videoId,
-    youtubeIds: [videoId],
-    source: 'youtube',
-    provider: 'YouTube',
-    playback: 'youtube-iframe',
-    mixReady: true,
-    dspReady: false,
-    title,
-    rawTitle: snippet?.title || title,
-    artist,
-    channelTitle: snippet?.channelTitle || details?.snippet?.channelTitle || 'YouTube',
-    artwork,
-    durationSec: safeDur,
-    duration: safeDur,
-    entrySec: defaultEntry,
-    exitSec: Math.min(safeDur - 3, defaultExit),
-    playFull: Boolean(cachedTrack?.playFull),
-    bpm: cachedTrack?.bpm || null,
-    key: cachedTrack?.key || null,
-    camelot: cachedTrack?.camelot || null,
-    energy: cachedTrack?.energy || 7,
-    heat: cachedTrack?.heat || null,
-    cueVotes: cachedTrack?.cueVotes || 0,
-    cueConfidence: cachedTrack?.cueConfidence || 'auto',
-    url: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
-    landingUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
-  };
-}
-
-export async function searchYouTubeTracks(query, apiKey, limit = 12) {
+export async function searchYouTubeTracks(query, apiKey, limit = 15) {
   let searchData = await fetchYtJson(
     'search',
     {
@@ -218,7 +221,14 @@ export async function searchYouTubeTracks(query, apiKey, limit = 12) {
       if (!videoId) return null;
       const details = detailsMap[videoId];
       if (details?.status?.embeddable === false) return null;
-      return buildTrackRecord(videoId, item.snippet, details, null);
+      const thumbs = item.snippet?.thumbnails || {};
+      return makeTrack({
+        videoId,
+        rawTitle: item.snippet?.title,
+        channelTitle: item.snippet?.channelTitle,
+        durationSec: parseIsoDuration(details?.contentDetails?.duration || ''),
+        artwork: thumbs.maxres?.url || thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url,
+      });
     })
     .filter(Boolean);
 }
@@ -240,9 +250,7 @@ export async function fetchYouTubePlaylistTracks(playlistId, apiKey, maxItems = 
         artwork: th.high?.url || th.medium?.url || th.default?.url || '',
       };
     }
-  } catch {
-    // Radio/Mix playlists (RD...) may not expose playlists.list metadata; playlistItems still works!
-  }
+  } catch {}
 
   const rawItems = [];
   let pageToken = '';
@@ -262,11 +270,13 @@ export async function fetchYouTubePlaylistTracks(playlistId, apiKey, maxItems = 
     if (!pageToken || rawItems.length >= maxItems) break;
   }
 
-  const validItems = rawItems.filter((item) => {
-    const vid = item?.contentDetails?.videoId || item?.snippet?.resourceId?.videoId;
-    const title = item?.snippet?.title || '';
-    return Boolean(vid) && title !== 'Deleted video' && title !== 'Private video';
-  }).slice(0, maxItems);
+  const validItems = rawItems
+    .filter((item) => {
+      const vid = item?.contentDetails?.videoId || item?.snippet?.resourceId?.videoId;
+      const title = item?.snippet?.title || '';
+      return Boolean(vid) && title !== 'Deleted video' && title !== 'Private video';
+    })
+    .slice(0, maxItems);
 
   const ids = validItems.map((item) => item?.contentDetails?.videoId || item?.snippet?.resourceId?.videoId);
   const detailsMap = ids.length ? await fetchVideoDetailsBatch(ids, apiKey) : {};
@@ -276,7 +286,14 @@ export async function fetchYouTubePlaylistTracks(playlistId, apiKey, maxItems = 
       const videoId = item?.contentDetails?.videoId || item?.snippet?.resourceId?.videoId;
       const details = detailsMap[videoId];
       if (!videoId || details?.status?.embeddable === false) return null;
-      return buildTrackRecord(videoId, item.snippet, details, null);
+      const thumbs = item.snippet?.thumbnails || {};
+      return makeTrack({
+        videoId,
+        rawTitle: item.snippet?.title,
+        channelTitle: item.snippet?.channelTitle,
+        durationSec: parseIsoDuration(details?.contentDetails?.duration || ''),
+        artwork: thumbs.maxres?.url || thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url,
+      });
     })
     .filter(Boolean);
 
@@ -301,5 +318,174 @@ export async function fetchSingleYouTubeTrack(videoId, apiKey) {
     err.status = 422;
     throw err;
   }
-  return buildTrackRecord(videoId, details.snippet, details, null);
+  const thumbs = details.snippet?.thumbnails || {};
+  return makeTrack({
+    videoId,
+    rawTitle: details.snippet?.title,
+    channelTitle: details.snippet?.channelTitle,
+    durationSec: parseIsoDuration(details.contentDetails?.duration || ''),
+    artwork: thumbs.maxres?.url || thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url,
+  });
+}
+
+/* =====================================================================
+   PUBLIC YOUTUBE EXTRACTOR FALLBACK (Zero API Key / Quota Fallback)
+   ===================================================================== */
+function extractInitialData(html) {
+  const m = html.match(/var ytInitialData = (\{.+?\});<\/script>/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]);
+  } catch {
+    return null;
+  }
+}
+
+export async function searchYouTubePublic(query, limit = 15) {
+  const res = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
+    headers: PUBLIC_HEADERS,
+  });
+  if (!res.ok) throw new Error(`YouTube search HTTP ${res.status}`);
+  const data = extractInitialData(await res.text());
+  if (!data) throw new Error('Unable to parse YouTube search results.');
+
+  const renderers = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.videoRenderer?.videoId) renderers.push(node.videoRenderer);
+    else if (Array.isArray(node)) node.forEach(walk);
+    else Object.values(node).forEach(walk);
+  };
+  walk(data.contents);
+
+  const seen = new Set();
+  return renderers
+    .filter((v) => {
+      if (!v.videoId || seen.has(v.videoId)) return false;
+      seen.add(v.videoId);
+      return true;
+    })
+    .slice(0, limit)
+    .map((v) => {
+      const rawTitle = v.title?.runs?.map((r) => r.text).join('') || v.title?.simpleText || 'Untitled';
+      const channel = v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || 'YouTube';
+      const durText = v.lengthText?.simpleText || '';
+      const thumbs = v.thumbnail?.thumbnails || [];
+      return makeTrack({
+        videoId: v.videoId,
+        rawTitle,
+        channelTitle: channel,
+        durationSec: parseClockDuration(durText),
+        artwork: thumbs[thumbs.length - 1]?.url,
+      });
+    });
+}
+
+export async function fetchYouTubePlaylistPublic(playlistId, maxItems = 150) {
+  const res = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`, {
+    headers: PUBLIC_HEADERS,
+  });
+  if (!res.ok) throw new Error(`YouTube playlist HTTP ${res.status}`);
+  const data = extractInitialData(await res.text());
+  if (!data) throw new Error('Could not parse public playlist page.');
+
+  const playlistTitle = data?.metadata?.playlistMetadataRenderer?.title || 'YouTube Playlist';
+  const tracks = [];
+  const seen = new Set();
+
+  const pushTrack = (videoId, rawTitle, channelTitle, durText, artwork) => {
+    if (!videoId || seen.has(videoId)) return;
+    seen.add(videoId);
+    tracks.push(
+      makeTrack({
+        videoId,
+        rawTitle,
+        channelTitle,
+        durationSec: parseClockDuration(durText),
+        artwork,
+      })
+    );
+  };
+
+  const walk = (node) => {
+    if (!node || typeof node !== 'object' || tracks.length >= maxItems) return;
+    if (node.playlistVideoRenderer?.videoId) {
+      const p = node.playlistVideoRenderer;
+      const thumbs = p.thumbnail?.thumbnails || [];
+      pushTrack(
+        p.videoId,
+        p.title?.runs?.map((r) => r.text).join('') || p.title?.simpleText,
+        p.shortBylineText?.runs?.[0]?.text || 'YouTube',
+        p.lengthText?.simpleText || '',
+        thumbs[thumbs.length - 1]?.url
+      );
+      return;
+    }
+    if (node.lockupViewModel?.contentId) {
+      const l = node.lockupViewModel;
+      const meta = l.metadata?.lockupMetadataViewModel;
+      const rawTitle = meta?.title?.content || 'Untitled';
+      const channel = meta?.metadata?.contentMetadataViewModel?.metadataRows?.[0]?.metadataParts?.[0]?.text?.content || 'YouTube';
+      const badge = l.contentImage?.thumbnailViewModel?.overlays?.[0]?.thumbnailBottomOverlayViewModel?.badges?.[0]?.thumbnailBadgeViewModel?.text || '';
+      const thumbs = l.contentImage?.thumbnailViewModel?.image?.sources || [];
+      pushTrack(l.contentId, rawTitle, channel, badge, thumbs[thumbs.length - 1]?.url);
+      return;
+    }
+    if (Array.isArray(node)) node.forEach(walk);
+    else Object.values(node).forEach(walk);
+  };
+  walk(data.contents);
+
+  // If playlist page didn't expose renderers (e.g. Mix RD... or Watch playlist), fetch /watch?list=...
+  if (!tracks.length) {
+    const wRes = await fetch(`https://www.youtube.com/watch?list=${encodeURIComponent(playlistId)}`, {
+      headers: PUBLIC_HEADERS,
+    });
+    if (wRes.ok) {
+      const wData = extractInitialData(await wRes.text());
+      const walkW = (node) => {
+        if (!node || typeof node !== 'object' || tracks.length >= maxItems) return;
+        const p = node.playlistPanelVideoRenderer;
+        if (p?.videoId) {
+          const thumbs = p.thumbnail?.thumbnails || [];
+          pushTrack(
+            p.videoId,
+            p.title?.simpleText || p.title?.runs?.[0]?.text,
+            p.shortBylineText?.runs?.[0]?.text || 'YouTube',
+            p.lengthText?.simpleText || '',
+            thumbs[thumbs.length - 1]?.url
+          );
+          return;
+        }
+        if (Array.isArray(node)) node.forEach(walkW);
+        else Object.values(node).forEach(walkW);
+      };
+      walkW(wData);
+    }
+  }
+
+  return {
+    playlistId,
+    title: playlistTitle,
+    channel: 'YouTube',
+    artwork: tracks[0]?.artwork || '',
+    count: tracks.length,
+    results: tracks,
+  };
+}
+
+export async function fetchSingleYouTubePublic(videoId) {
+  const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    return makeTrack({ videoId, rawTitle: `YouTube Track (${videoId})`, channelTitle: 'YouTube', durationSec: 210 });
+  }
+  const info = await res.json();
+  return makeTrack({
+    videoId,
+    rawTitle: info.title || `YouTube Track (${videoId})`,
+    channelTitle: info.author_name || 'YouTube',
+    durationSec: 210,
+    artwork: info.thumbnail_url,
+  });
 }
