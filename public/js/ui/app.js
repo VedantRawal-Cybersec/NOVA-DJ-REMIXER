@@ -105,6 +105,8 @@ const state = {
   sweepKey: 0,
   lastLiveId: 'A',
   lastPaused: false,
+  lastRenderSig: '',
+  animatingSwap: false,
   dragCueSec: null,
   showDragHint: false,
   hintTimer: null,
@@ -135,32 +137,47 @@ function initOrchestrator() {
   return orchestrator;
 }
 
+function buildRenderSig(snap) {
+  const liveSlot = snap.decks?.[snap.liveId];
+  const cueSlot = snap.decks?.[snap.cueId];
+  return [
+    snap.liveId,
+    liveSlot?.track?.id || '',
+    liveSlot?.status || '',
+    Boolean(liveSlot?.playFull),
+    cueSlot?.track?.id || '',
+    cueSlot?.status || '',
+    Boolean(snap.crossfading),
+    Boolean(snap.paused),
+  ].join('|');
+}
+
 function handleOrchestratorUpdate(snap) {
   const prevLive = state.lastLiveId;
   state.snap = snap;
 
   if (state.screen === 'playing') {
     if (snap.finished) {
+      state.animatingSwap = false;
+      state.lastRenderSig = '';
       state.screen = 'summary';
       ytHost.setAttribute('data-visible', 'false');
       render();
       return;
     }
-    if (snap.liveId !== prevLive || snap.paused !== state.lastPaused) {
-      const pauseChanged = snap.paused !== state.lastPaused;
-      state.lastPaused = snap.paused;
-      if (snap.liveId === prevLive && pauseChanged) {
-        render();
-        return;
-      }
+
+    if (snap.liveId !== prevLive) {
       const oldLiveEl = document.querySelector(`.deck[data-deck="${prevLive}"]`);
       const newLiveEl = document.querySelector(`.deck[data-deck="${snap.liveId}"]`);
       state.lastLiveId = snap.liveId;
+      state.lastPaused = snap.paused;
+      state.lastRenderSig = buildRenderSig(snap);
       state.sweepKey += 1;
       state.stems = { vocals: true, drums: true, bass: true, other: true };
       state.loopActive = false;
       triggerCueHint();
       if (oldLiveEl && newLiveEl) {
+        state.animatingSwap = true;
         oldLiveEl.setAttribute('data-slot', 'out');
         newLiveEl.setAttribute('data-slot', 'live');
         const stage = document.getElementById('play-stage');
@@ -171,13 +188,34 @@ function handleOrchestratorUpdate(snap) {
           setTimeout(() => sw.remove(), 1550);
         }
         setTimeout(() => {
-          if (state.screen === 'playing') render();
+          state.animatingSwap = false;
+          if (state.screen === 'playing') {
+            state.lastRenderSig = buildRenderSig(state.snap);
+            render();
+          }
         }, 1520);
       } else {
         render();
       }
       return;
     }
+
+    if (state.animatingSwap) {
+      const agentMsg = document.getElementById('agent-msg');
+      if (agentMsg && agentMsg.textContent !== snap.agentMessage) {
+        agentMsg.textContent = snap.agentMessage;
+      }
+      return;
+    }
+
+    const sig = buildRenderSig(snap);
+    if (sig !== state.lastRenderSig || snap.paused !== state.lastPaused) {
+      state.lastPaused = snap.paused;
+      state.lastRenderSig = sig;
+      render();
+      return;
+    }
+
     syncPlayingDom();
   }
 }
@@ -197,7 +235,9 @@ async function fetchHealth() {
     const res = await fetch('/api/health');
     if (res.ok) state.health = await res.json();
   } catch {}
-  if (state.screen === 'wizard' && state.wizardStep === 0) render();
+  if (state.screen === 'wizard' && state.wizardStep === 0 && document.activeElement?.id !== 'input-source') {
+    render();
+  }
 }
 
 async function loadSavedSets() {
@@ -453,6 +493,9 @@ async function approveAndPlay() {
   const orch = initOrchestrator();
   state.screen = 'playing';
   state.lastLiveId = 'A';
+  state.lastPaused = false;
+  state.lastRenderSig = '';
+  state.animatingSwap = false;
   state.sweepKey = 0;
   state.exitConfirm = false;
   triggerCueHint();

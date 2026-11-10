@@ -155,7 +155,7 @@ export class NovaOrchestrator {
   }
 
   async startSet(tracks, { vibe = 'peak', playMode = 'club', ytCrossfadeSec = 5.5, ytTransitionStyle = 'phrase', ytFxEnabled = true } = {}) {
-    this.stop();
+    this.stop(true);
     this.vibe = vibe;
     this.playMode = playMode;
     this.ytCrossfadeSec = ytCrossfadeSec;
@@ -168,6 +168,12 @@ export class NovaOrchestrator {
     this.paused = false;
     this.crossfading = false;
     this.running = true;
+    this.liveDeckId = 'A';
+
+    this.decks.A.track = this.queue[0] || null;
+    this.decks.A.status = this.queue[0] ? 'loading' : 'empty';
+    this.decks.B.track = this.queue[1] || null;
+    this.decks.B.status = this.queue[1] ? 'loading' : 'empty';
 
     const hasYt = this.queue.some((t) => !this.#isDspTrack(t));
     const hasDsp = this.queue.some((t) => this.#isDspTrack(t));
@@ -177,6 +183,7 @@ export class NovaOrchestrator {
     }
     if (hasYt && !this.ytReady) {
       this.#setAgent('Connecting Dual YouTube Decks…');
+      this.#emit();
       await this.ytEngine.init();
       this.ytReady = true;
     }
@@ -619,7 +626,7 @@ export class NovaOrchestrator {
     return this.proMixer.toggleLoopBars(this.liveDeckId, 4);
   }
 
-  stop() {
+  stop(silent = false) {
     this.running = false;
     this.paused = false;
     this.crossfading = false;
@@ -631,7 +638,7 @@ export class NovaOrchestrator {
     this.decks.A.track = null;
     this.decks.B.status = 'empty';
     this.decks.B.track = null;
-    this.#emit();
+    if (!silent) this.#emit();
   }
 
   #setAgent(msg) {
