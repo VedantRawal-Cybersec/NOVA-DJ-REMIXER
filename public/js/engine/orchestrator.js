@@ -461,6 +461,7 @@ export class NovaOrchestrator {
 
     const upcoming = this.#popNext();
     if (upcoming) {
+      this.#setAgent(`LIVE · ${inSlot.track.title.toUpperCase()} · NEXT: ${upcoming.title.toUpperCase()}`);
       this.#preloadDeck(outId, upcoming);
     } else {
       this.#setAgent(`FINAL TRACK · ${inSlot.track.title.toUpperCase()}`);

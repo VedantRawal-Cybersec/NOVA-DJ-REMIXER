@@ -870,7 +870,7 @@ button {
 
 @media (max-width: 767px) {
   .deck[data-slot="cue"] {
-    transform: translate3d(0, calc(100cqh - 54%), 0) scale(0.62);
+    transform: translate3d(0, calc(100cqh - 72%), 0) scale(0.58);
   }
   .deck[data-slot="out"] {
     transform: translate3d(0, -12vh, 0) scale(0.94);
