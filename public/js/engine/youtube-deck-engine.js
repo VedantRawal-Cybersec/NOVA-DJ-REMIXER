@@ -43,6 +43,7 @@ export class YouTubeDeckEngine {
     };
     this.fadeTimer = null;
     this.readyResolvers = { A: null, B: null };
+    this.cueWaiters = { A: [], B: [] };
   }
 
   async init() {
@@ -87,23 +88,44 @@ export class YouTubeDeckEngine {
     });
   }
 
+  #resolveCueWaiters(deckId, ok) {
+    const waiters = this.cueWaiters[deckId];
+    if (!waiters?.length) return;
+    this.cueWaiters[deckId] = [];
+    for (const fn of waiters) fn(ok);
+  }
+
   #onStateChange(deck, stateCode) {
     if (!deck.track) return;
     // 1 = PLAYING, 0 = ENDED
     if (stateCode === 1) {
+      try {
+        const realDur = deck.player.getDuration?.();
+        if (realDur && realDur > 10 && (!deck.track.durationSec || Math.abs(deck.track.durationSec - realDur) > 8)) {
+          deck.track.durationSec = Math.round(realDur);
+        }
+      } catch {}
+
       if (deck.status === 'loading' && deck.role === 'preload') {
         clearTimeout(deck.timer);
-        deck.player.pauseVideo();
-        const startAt = deck.track.playFull ? 0 : (deck.track.entrySec || 0);
-        deck.player.seekTo(startAt, true);
+        try {
+          deck.player.pauseVideo();
+          const startAt = deck.track.playFull ? 0 : (deck.track.entrySec || 0);
+          deck.player.seekTo(startAt, true);
+        } catch {}
         deck.status = 'ready';
+        this.#resolveCueWaiters(deck.id, true);
         this.cb.onDeckReady?.(deck.id, deck.track);
       } else if (deck.status === 'loading' && deck.role === 'live') {
         clearTimeout(deck.timer);
         deck.status = 'live';
+        this.#resolveCueWaiters(deck.id, true);
         this.cb.onDeckLive?.(deck.id, deck.track);
       } else if (deck.status === 'waiting-fade') {
         clearTimeout(deck.timer);
+        try {
+          deck.player.unMute();
+        } catch {}
         deck.status = 'live';
         deck.role = 'live';
         this.readyResolvers[deck.id]?.(true);
@@ -116,6 +138,7 @@ export class YouTubeDeckEngine {
 
   #onError(deck, code) {
     clearTimeout(deck.timer);
+    this.#resolveCueWaiters(deck.id, false);
     if (this.readyResolvers[deck.id]) {
       this.readyResolvers[deck.id](false);
       this.readyResolvers[deck.id] = null;
@@ -127,32 +150,54 @@ export class YouTubeDeckEngine {
     const deck = this.decks[deckId];
     if (!deck?.player || !track?.videoId) return;
     clearTimeout(deck.timer);
+    this.#resolveCueWaiters(deckId, false);
     deck.track = track;
     deck.role = role;
     deck.status = 'loading';
 
-    let startSec = 0;
-    if (!track.playFull) {
-      startSec = playMode === 'hooks' ? (track.entrySec || 28) : (track.clubEntry ?? 0);
-    }
+    const startSec = track.playFull ? 0 : Math.max(0, Number(track.entrySec ?? 0));
 
-    if (role === 'preload') {
-      deck.player.mute();
-      deck.player.setVolume(0);
-    } else {
-      deck.player.unMute();
-      deck.player.setVolume(100);
-    }
+    try {
+      if (role === 'preload') {
+        deck.player.mute();
+        deck.player.setVolume(0);
+      } else {
+        deck.player.unMute();
+        deck.player.setVolume(100);
+      }
+      deck.player.loadVideoById({ videoId: track.videoId, startSeconds: startSec });
+      if (role === 'live') {
+        deck.player.playVideo();
+      }
+    } catch {}
 
-    deck.player.loadVideoById({ videoId: track.videoId, startSeconds: startSec });
-    if (role === 'live') {
-      try { deck.player.playVideo(); } catch {}
-    }
     deck.timer = setTimeout(() => {
       if (deck.status === 'loading') {
+        this.#resolveCueWaiters(deckId, false);
         this.cb.onDeckError?.(deckId, track, 'timeout');
       }
     }, 18000);
+  }
+
+  waitForReady(deckId, timeoutMs = 5500) {
+    const deck = this.decks[deckId];
+    if (!deck) return Promise.resolve(false);
+    if (deck.status === 'ready' || deck.status === 'live') return Promise.resolve(true);
+    if (deck.status === 'empty') return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        resolve(deck.status === 'ready' || deck.status === 'live');
+      }, timeoutMs);
+      this.cueWaiters[deckId].push((ok) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(ok);
+      });
+    });
   }
 
   async playPreloaded(deckId) {
@@ -160,20 +205,39 @@ export class YouTubeDeckEngine {
     if (!deck?.player) return false;
     return new Promise((resolve) => {
       deck.status = 'waiting-fade';
-      deck.player.setVolume(0);
-      deck.player.unMute();
-      deck.player.playVideo();
-      this.readyResolvers[deckId] = resolve;
-      deck.timer = setTimeout(() => {
-        if (this.readyResolvers[deckId]) {
-          this.readyResolvers[deckId](false);
-          this.readyResolvers[deckId] = null;
-        }
-      }, 4500);
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(retryTimer);
+        clearTimeout(deck.timer);
+        this.readyResolvers[deckId] = null;
+        resolve(ok);
+      };
+
+      this.readyResolvers[deckId] = finish;
+      try {
+        deck.player.setVolume(0);
+        deck.player.unMute();
+        deck.player.playVideo();
+      } catch {}
+
+      // Fallback if strict autoplay policy blocks unmuted play() outside user gesture:
+      // start muted (always allowed), then unmute inside #onStateChange(1) at 0% volume!
+      const retryTimer = setTimeout(() => {
+        if (settled || deck.status !== 'waiting-fade') return;
+        try {
+          deck.player.mute();
+          deck.player.setVolume(0);
+          deck.player.playVideo();
+        } catch {}
+      }, 1800);
+
+      deck.timer = setTimeout(() => finish(false), 5200);
     });
   }
 
-  crossfade(outDeckId, inDeckId, durationMs = 3000) {
+  crossfade(outDeckId, inDeckId, durationMs = 5000, style = 'phrase') {
     return new Promise((resolve) => {
       const outDeck = this.decks[outDeckId];
       const inDeck = this.decks[inDeckId];
@@ -182,12 +246,29 @@ export class YouTubeDeckEngine {
       const start = performance.now();
       this.fadeTimer = setInterval(() => {
         const p = Math.min(1, (performance.now() - start) / durationMs);
-        const volIn = Math.round(100 * Math.sin((p * Math.PI) / 2));
-        const volOut = Math.round(100 * Math.cos((p * Math.PI) / 2));
+        let volIn = 100 * Math.sin((p * Math.PI) / 2);
+        let volOut = 100 * Math.cos((p * Math.PI) / 2);
+
+        if (style === 'sweep_cut') {
+          // Risers build incoming stealthily until hard energy cut at 62%
+          volIn = p < 0.62 ? 42 * (p / 0.62) : 42 + 58 * Math.min(1, (p - 0.62) / 0.14);
+          volOut = p < 0.62 ? 100 - 20 * (p / 0.62) : Math.max(0, 80 * (1 - (p - 0.62) / 0.22));
+        } else if (style === 'echo_drop') {
+          // Slight dip on out, punch incoming straight up on the drop at 55%
+          volIn = p < 0.55 ? 28 * (p / 0.55) : 100 * Math.sin(((p - 0.55) / 0.45) * (Math.PI / 2) * 0.65 + 0.35 * (Math.PI / 2));
+          volOut = p < 0.55 ? 100 - 35 * (p / 0.55) : Math.max(0, 65 * Math.cos(((p - 0.55) / 0.45) * (Math.PI / 2)));
+        } else {
+          // Smooth Club S-curve equal-power overlap (full body phrase blend)
+          const smooth = p * p * (3 - 2 * p);
+          volIn = 100 * Math.sin((smooth * Math.PI) / 2);
+          volOut = 100 * Math.cos((smooth * Math.PI) / 2);
+        }
+
         try {
-          if (inDeck?.player) inDeck.player.setVolume(volIn);
-          if (outDeck?.player && outDeck.track) outDeck.player.setVolume(volOut);
+          if (inDeck?.player) inDeck.player.setVolume(Math.round(Math.max(0, Math.min(100, volIn))));
+          if (outDeck?.player && outDeck.track) outDeck.player.setVolume(Math.round(Math.max(0, Math.min(100, volOut))));
         } catch {}
+
         if (p >= 1) {
           clearInterval(this.fadeTimer);
           this.fadeTimer = null;
@@ -200,8 +281,10 @@ export class YouTubeDeckEngine {
             outDeck.track = null;
           }
           if (inDeck?.player) {
-            inDeck.player.unMute();
-            inDeck.player.setVolume(100);
+            try {
+              inDeck.player.unMute();
+              inDeck.player.setVolume(100);
+            } catch {}
             inDeck.status = 'live';
             inDeck.role = 'live';
           }
@@ -281,6 +364,7 @@ export class YouTubeDeckEngine {
     if (this.fadeTimer) clearInterval(this.fadeTimer);
     for (const id of ['A', 'B']) {
       clearTimeout(this.decks[id].timer);
+      this.#resolveCueWaiters(id, false);
       try {
         this.decks[id].player?.pauseVideo();
         this.decks[id].player?.mute();

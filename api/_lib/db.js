@@ -4,55 +4,116 @@ const { Pool } = pg;
 
 let pgPool = null;
 let schemaReadyPromise = null;
+let tursoSchemaPromise = null;
+
+function isPostgresUrl(val) {
+  return typeof val === 'string' && /^postgres(?:ql)?:\/\//i.test(val.trim());
+}
+
+function findMatchingEnv(suffixes) {
+  const entries = Object.entries(process.env);
+  for (const suffix of suffixes) {
+    if (process.env[suffix]) return { key: suffix, val: process.env[suffix] };
+  }
+  for (const [k, v] of entries) {
+    if (!v) continue;
+    for (const suffix of suffixes) {
+      if (k.toUpperCase().endsWith(`_${suffix}`)) {
+        return { key: k, val: v };
+      }
+    }
+  }
+  return null;
+}
 
 function detectConfig() {
-  let pgUrl =
-    process.env.POSTGRES_URL ||
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_PRISMA_URL ||
-    process.env.PRISMA_DATABASE_URL ||
-    process.env.NEON_DATABASE_URL ||
-    process.env.POSTGRES_URL_NON_POOLING ||
-    process.env.POSTGRES_URL_NO_SSL ||
-    process.env.STORAGE_URL ||
-    '';
+  // 1. Direct & Marketplace Postgres (Vercel Postgres, Neon, Supabase Postgres, Prisma Postgres direct, AWS Aurora, Nile)
+  const preferredPgKeys = [
+    'DATABASE_URL_POOLED',
+    'POSTGRES_URL_POOLED',
+    'POSTGRES_URL',
+    'DATABASE_URL',
+    'NEON_DATABASE_URL',
+    'POSTGRES_PRISMA_URL',
+    'STORAGE_URL',
+    'POSTGRES_URL_NON_POOLING',
+    'DATABASE_URL_UNPOOLED',
+    'POSTGRES_URL_NO_SSL',
+    'PRISMA_DATABASE_URL',
+    'DIRECT_URL',
+  ];
 
-  if (!pgUrl && process.env.PGHOST && process.env.PGDATABASE && process.env.PGUSER) {
+  for (const k of preferredPgKeys) {
+    const val = process.env[k]?.trim();
+    if (isPostgresUrl(val)) {
+      return { provider: 'postgres', pgUrl: val, envKey: k };
+    }
+  }
+
+  // Dynamic scan for custom Vercel integration prefixes (e.g. NOVA_POSTGRES_URL, APP_DATABASE_URL, etc.)
+  const dynamicPg = Object.entries(process.env)
+    .filter(([k, v]) => isPostgresUrl(v) && !/ACCELERATE/i.test(k))
+    .sort(([a], [b]) => {
+      const score = (n) => (/POOLED/i.test(n) ? 0 : /DATABASE_URL|POSTGRES_URL/i.test(n) ? 1 : /UNPOOLED|DIRECT/i.test(n) ? 3 : 2);
+      return score(a) - score(b);
+    });
+
+  if (dynamicPg.length) {
+    return { provider: 'postgres', pgUrl: dynamicPg[0][1].trim(), envKey: dynamicPg[0][0] };
+  }
+
+  if (process.env.PGHOST && process.env.PGDATABASE && process.env.PGUSER) {
     const port = process.env.PGPORT || '5432';
     const pass = process.env.PGPASSWORD ? `:${encodeURIComponent(process.env.PGPASSWORD)}` : '';
-    pgUrl = `postgresql://${encodeURIComponent(process.env.PGUSER)}${pass}@${process.env.PGHOST}:${port}/${process.env.PGDATABASE}`;
+    const pgUrl = `postgresql://${encodeURIComponent(process.env.PGUSER)}${pass}@${process.env.PGHOST}:${port}/${process.env.PGDATABASE}`;
+    return { provider: 'postgres', pgUrl, envKey: 'PGHOST' };
   }
 
-  if (pgUrl) {
-    return { provider: 'postgres', pgUrl };
-  }
-
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-  const supabaseKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.SUPABASE_ANON_KEY ||
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-    '';
-
-  if (supabaseUrl && supabaseKey) {
+  // 2. Supabase REST (direct or custom Marketplace prefix)
+  const sbUrlMatch = findMatchingEnv(['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL']);
+  const sbKeyMatch = findMatchingEnv(['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']);
+  if (sbUrlMatch?.val && sbKeyMatch?.val) {
     return {
       provider: 'supabase',
-      supabaseUrl: supabaseUrl.replace(/\/+$/, ''),
-      supabaseKey,
+      supabaseUrl: sbUrlMatch.val.trim().replace(/\/+$/, ''),
+      supabaseKey: sbKeyMatch.val.trim(),
+      envKey: sbUrlMatch.key,
     };
   }
 
-  const kvUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
-  const kvToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
-  if (kvUrl && kvToken) {
+  // 3. Upstash Redis / Vercel KV REST (direct or custom prefix)
+  const kvUrlMatch = findMatchingEnv(['KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL', 'REDIS_REST_URL']);
+  const kvTokenMatch = findMatchingEnv(['KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN', 'REDIS_REST_TOKEN']);
+  if (kvUrlMatch?.val && kvTokenMatch?.val) {
     return {
       provider: 'kv',
-      kvUrl: kvUrl.replace(/\/+$/, ''),
-      kvToken,
+      kvUrl: kvUrlMatch.val.trim().replace(/\/+$/, ''),
+      kvToken: kvTokenMatch.val.trim(),
+      envKey: kvUrlMatch.key,
     };
   }
 
-  return { provider: 'none' };
+  // 4. Turso / libSQL HTTP API (zero extra deps)
+  const tursoUrlMatch = findMatchingEnv(['TURSO_DATABASE_URL', 'LIBSQL_URL', 'LIBSQL_DATABASE_URL']);
+  const tursoTokenMatch = findMatchingEnv(['TURSO_AUTH_TOKEN', 'LIBSQL_AUTH_TOKEN']);
+  if (tursoUrlMatch?.val) {
+    const httpUrl = tursoUrlMatch.val.trim().replace(/^libsql:\/\//i, 'https://').replace(/\/+$/, '');
+    if (/^https?:\/\//i.test(httpUrl)) {
+      return {
+        provider: 'turso',
+        tursoUrl: httpUrl,
+        tursoToken: tursoTokenMatch?.val?.trim() || '',
+        envKey: tursoUrlMatch.key,
+      };
+    }
+  }
+
+  // Detect unsupported raw vars cleanly (key names only, zero secret values)
+  const candidateKey = Object.keys(process.env).find((k) =>
+    /^(?:.*_)?(?:MONGODB_URI|REDIS_URL|KV_URL|CONVEX_DEPLOYMENT)$/i.test(k) && process.env[k]
+  );
+
+  return { provider: 'none', unmappedEnvKey: candidateKey || null };
 }
 
 function getPool(pgUrl) {
@@ -141,6 +202,100 @@ async function ensurePgSchema(pool) {
   return schemaReadyPromise;
 }
 
+function toTursoArg(v) {
+  if (v === null || v === undefined) return { type: 'null', value: null };
+  if (typeof v === 'boolean') return { type: 'integer', value: v ? '1' : '0' };
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) return { type: 'null', value: null };
+    return Number.isInteger(v) ? { type: 'integer', value: String(v) } : { type: 'float', value: v };
+  }
+  return { type: 'text', value: String(v) };
+}
+
+function fromTursoVal(cell) {
+  if (!cell || cell.type === 'null') return null;
+  if (cell.type === 'integer') return Number(cell.value);
+  if (cell.type === 'float') return Number(cell.value);
+  return cell.value;
+}
+
+async function tursoPipeline(cfg, statements) {
+  const requests = statements.map((s) => ({
+    type: 'execute',
+    stmt: {
+      sql: s.sql,
+      args: (s.args || []).map(toTursoArg),
+    },
+  }));
+  requests.push({ type: 'close' });
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (cfg.tursoToken) headers.Authorization = `Bearer ${cfg.tursoToken}`;
+
+  const res = await fetch(`${cfg.tursoUrl}/v2/pipeline`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ requests }),
+  });
+  if (!res.ok) throw new Error(`Turso HTTP ${res.status}`);
+  const data = await res.json();
+  return (data.results || []).map((r) => {
+    if (r.type === 'error') throw new Error(r.error?.message || 'Turso SQL error');
+    const result = r.response?.result;
+    if (!result) return [];
+    const cols = (result.cols || []).map((c) => c.name);
+    return (result.rows || []).map((row) => {
+      const obj = {};
+      cols.forEach((col, i) => { obj[col] = fromTursoVal(row[i]); });
+      return obj;
+    });
+  });
+}
+
+async function ensureTursoSchema(cfg) {
+  if (!tursoSchemaPromise) {
+    tursoSchemaPromise = tursoPipeline(cfg, [
+      {
+        sql: `CREATE TABLE IF NOT EXISTS nova_tracks (
+          track_id TEXT PRIMARY KEY, source TEXT NOT NULL, youtube_id TEXT,
+          title TEXT NOT NULL, artist TEXT NOT NULL, artwork TEXT, stream_url TEXT,
+          duration_sec REAL DEFAULT 0, bpm REAL, musical_key TEXT, camelot TEXT,
+          energy REAL DEFAULT 6, lufs REAL, entry_sec REAL DEFAULT 0, exit_sec REAL,
+          play_full INTEGER DEFAULT 0, heat_json TEXT, sections_json TEXT,
+          cue_votes INTEGER DEFAULT 0, cue_confidence TEXT DEFAULT 'auto',
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )`,
+      },
+      {
+        sql: `CREATE TABLE IF NOT EXISTS nova_playlists (
+          playlist_id TEXT PRIMARY KEY, title TEXT NOT NULL, channel TEXT,
+          artwork TEXT, item_count INTEGER DEFAULT 0, items_json TEXT NOT NULL,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )`,
+      },
+      {
+        sql: `CREATE TABLE IF NOT EXISTS nova_sets (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, name TEXT NOT NULL,
+          vibe_json TEXT, tracks_json TEXT NOT NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )`,
+      },
+      {
+        sql: `CREATE TABLE IF NOT EXISTS nova_cue_feedback (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, track_id TEXT NOT NULL,
+          session_id TEXT NOT NULL, action TEXT NOT NULL,
+          from_sec REAL, to_sec REAL, rating TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )`,
+      },
+    ]).catch((err) => {
+      tursoSchemaPromise = null;
+      throw err;
+    });
+  }
+  return tursoSchemaPromise;
+}
+
 async function kvCmd(cfg, command) {
   const res = await fetch(cfg.kvUrl, {
     method: 'POST',
@@ -173,30 +328,47 @@ async function supabaseReq(cfg, path, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
+function safeParseJson(v, fallback = null) {
+  if (!v) return fallback;
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch { return fallback; }
+}
+
 export async function getDbHealth() {
   const cfg = detectConfig();
   if (cfg.provider === 'none') {
-    return { connected: false, provider: 'none', mode: 'browser-fallback' };
+    return {
+      connected: false,
+      provider: 'none',
+      mode: 'browser-fallback',
+      ...(cfg.unmappedEnvKey ? { unmappedEnvKey: cfg.unmappedEnvKey } : {}),
+    };
   }
   try {
     if (cfg.provider === 'postgres') {
       const pool = getPool(cfg.pgUrl);
       await ensurePgSchema(pool);
       await pool.query('SELECT 1');
-      return { connected: true, provider: 'postgres', mode: 'persistent' };
+      return { connected: true, provider: 'postgres', mode: 'persistent', envKey: cfg.envKey };
+    }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      await tursoPipeline(cfg, [{ sql: 'SELECT 1' }]);
+      return { connected: true, provider: 'turso', mode: 'persistent', envKey: cfg.envKey };
     }
     if (cfg.provider === 'supabase') {
       await supabaseReq(cfg, 'nova_tracks?select=track_id&limit=1');
-      return { connected: true, provider: 'supabase', mode: 'persistent' };
+      return { connected: true, provider: 'supabase', mode: 'persistent', envKey: cfg.envKey };
     }
     if (cfg.provider === 'kv') {
       await kvCmd(cfg, ['PING']);
-      return { connected: true, provider: 'kv', mode: 'persistent' };
+      return { connected: true, provider: 'kv', mode: 'persistent', envKey: cfg.envKey };
     }
   } catch (err) {
     return {
       connected: false,
       provider: cfg.provider,
+      envKey: cfg.envKey,
       mode: 'browser-fallback',
       error: err?.message || 'Database check failed',
     };
@@ -265,6 +437,51 @@ export async function upsertTracks(tracks) {
       return { persisted: true, provider: 'postgres' };
     }
 
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      const stmts = tracks.slice(0, 100).filter((t) => t && t.id).map((t) => ({
+        sql: `INSERT INTO nova_tracks (
+          track_id, source, youtube_id, title, artist, artwork, stream_url,
+          duration_sec, bpm, musical_key, camelot, energy, lufs,
+          entry_sec, exit_sec, play_full, heat_json, sections_json, cue_confidence
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(track_id) DO UPDATE SET
+          title = COALESCE(NULLIF(excluded.title, ''), nova_tracks.title),
+          artist = COALESCE(NULLIF(excluded.artist, ''), nova_tracks.artist),
+          duration_sec = MAX(nova_tracks.duration_sec, excluded.duration_sec),
+          bpm = COALESCE(excluded.bpm, nova_tracks.bpm),
+          musical_key = COALESCE(excluded.musical_key, nova_tracks.musical_key),
+          camelot = COALESCE(excluded.camelot, nova_tracks.camelot),
+          entry_sec = CASE WHEN nova_tracks.cue_votes > 0 AND excluded.cue_confidence <> 'user' THEN nova_tracks.entry_sec ELSE COALESCE(excluded.entry_sec, nova_tracks.entry_sec) END,
+          exit_sec = CASE WHEN nova_tracks.cue_votes > 0 AND excluded.cue_confidence <> 'user' THEN nova_tracks.exit_sec ELSE COALESCE(excluded.exit_sec, nova_tracks.exit_sec) END,
+          heat_json = COALESCE(excluded.heat_json, nova_tracks.heat_json),
+          updated_at = CURRENT_TIMESTAMP`,
+        args: [
+          String(t.id),
+          String(t.source || 'youtube'),
+          t.videoId || null,
+          String(t.title || 'Untitled'),
+          String(t.artist || 'Unknown artist'),
+          t.artwork || null,
+          t.streamUrl || null,
+          Number(t.durationSec) || 0,
+          Number.isFinite(Number(t.bpm)) ? Number(t.bpm) : null,
+          t.key || null,
+          t.camelot || null,
+          Number.isFinite(Number(t.energy)) ? Number(t.energy) : 6,
+          Number.isFinite(Number(t.lufs)) ? Number(t.lufs) : null,
+          Number.isFinite(Number(t.entrySec)) ? Number(t.entrySec) : 0,
+          Number.isFinite(Number(t.exitSec)) ? Number(t.exitSec) : null,
+          Boolean(t.playFull),
+          t.heat ? JSON.stringify(t.heat) : null,
+          t.sections ? JSON.stringify(t.sections) : null,
+          String(t.cueConfidence || 'auto'),
+        ],
+      }));
+      if (stmts.length) await tursoPipeline(cfg, stmts);
+      return { persisted: true, provider: 'turso' };
+    }
+
     if (cfg.provider === 'kv') {
       const pipeline = tracks.slice(0, 100).filter(Boolean).map((t) =>
         kvCmd(cfg, ['SET', `nova:track:${t.id}`, JSON.stringify(t), 'EX', 60 * 60 * 24 * 30])
@@ -307,6 +524,31 @@ export async function upsertTracks(tracks) {
   return { persisted: false };
 }
 
+function mapTrackRow(r) {
+  return {
+    id: r.track_id,
+    source: r.source,
+    videoId: r.youtube_id,
+    title: r.title,
+    artist: r.artist,
+    artwork: r.artwork,
+    streamUrl: r.stream_url,
+    durationSec: r.duration_sec,
+    bpm: r.bpm,
+    key: r.musical_key,
+    camelot: r.camelot,
+    energy: r.energy,
+    lufs: r.lufs,
+    entrySec: r.entry_sec,
+    exitSec: r.exit_sec,
+    playFull: Boolean(r.play_full),
+    heat: safeParseJson(r.heat_json),
+    sections: safeParseJson(r.sections_json),
+    cueVotes: r.cue_votes || 0,
+    cueConfidence: r.cue_confidence,
+  };
+}
+
 export async function getTracksByIds(ids) {
   if (!Array.isArray(ids) || !ids.length) return {};
   const cleanIds = ids.map(String).slice(0, 150);
@@ -317,35 +559,20 @@ export async function getTracksByIds(ids) {
     if (cfg.provider === 'postgres') {
       const pool = getPool(cfg.pgUrl);
       await ensurePgSchema(pool);
-      const { rows } = await pool.query(
-        'SELECT * FROM nova_tracks WHERE track_id = ANY($1)',
-        [cleanIds]
-      );
+      const { rows } = await pool.query('SELECT * FROM nova_tracks WHERE track_id = ANY($1)', [cleanIds]);
       const map = {};
-      for (const r of rows) {
-        map[r.track_id] = {
-          id: r.track_id,
-          source: r.source,
-          videoId: r.youtube_id,
-          title: r.title,
-          artist: r.artist,
-          artwork: r.artwork,
-          streamUrl: r.stream_url,
-          durationSec: r.duration_sec,
-          bpm: r.bpm,
-          key: r.musical_key,
-          camelot: r.camelot,
-          energy: r.energy,
-          lufs: r.lufs,
-          entrySec: r.entry_sec,
-          exitSec: r.exit_sec,
-          playFull: r.play_full,
-          heat: r.heat_json,
-          sections: r.sections_json,
-          cueVotes: r.cue_votes,
-          cueConfidence: r.cue_confidence,
-        };
-      }
+      for (const r of rows) map[r.track_id] = mapTrackRow(r);
+      return map;
+    }
+
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      const placeholders = cleanIds.map(() => '?').join(',');
+      const [rows] = await tursoPipeline(cfg, [
+        { sql: `SELECT * FROM nova_tracks WHERE track_id IN (${placeholders})`, args: cleanIds },
+      ]);
+      const map = {};
+      for (const r of rows || []) map[r.track_id] = mapTrackRow(r);
       return map;
     }
 
@@ -355,9 +582,7 @@ export async function getTracksByIds(ids) {
       if (Array.isArray(values)) {
         values.forEach((raw, idx) => {
           if (raw) {
-            try {
-              map[cleanIds[idx]] = JSON.parse(raw);
-            } catch {}
+            try { map[cleanIds[idx]] = JSON.parse(raw); } catch {}
           }
         });
       }
@@ -368,29 +593,7 @@ export async function getTracksByIds(ids) {
       const inList = cleanIds.map((id) => encodeURIComponent(id)).join(',');
       const rows = await supabaseReq(cfg, `nova_tracks?track_id=in.(${inList})`);
       const map = {};
-      for (const r of rows || []) {
-        map[r.track_id] = {
-          id: r.track_id,
-          source: r.source,
-          videoId: r.youtube_id,
-          title: r.title,
-          artist: r.artist,
-          artwork: r.artwork,
-          streamUrl: r.stream_url,
-          durationSec: r.duration_sec,
-          bpm: r.bpm,
-          key: r.musical_key,
-          camelot: r.camelot,
-          energy: r.energy,
-          entrySec: r.entry_sec,
-          exitSec: r.exit_sec,
-          playFull: r.play_full,
-          heat: r.heat_json,
-          sections: r.sections_json,
-          cueVotes: r.cue_votes || 0,
-          cueConfidence: r.cue_confidence,
-        };
-      }
+      for (const r of rows || []) map[r.track_id] = mapTrackRow(r);
       return map;
     }
   } catch (err) {
@@ -401,36 +604,32 @@ export async function getTracksByIds(ids) {
 
 export async function searchCachedTracks(query, limit = 12) {
   const cfg = detectConfig();
-  if (cfg.provider !== 'postgres') return [];
+  if (cfg.provider !== 'postgres' && cfg.provider !== 'turso') return [];
   try {
-    const pool = getPool(cfg.pgUrl);
-    await ensurePgSchema(pool);
     const pattern = `%${query}%`;
-    const { rows } = await pool.query(
-      `SELECT * FROM nova_tracks
-       WHERE title ILIKE $1 OR artist ILIKE $1
-       ORDER BY cue_votes DESC, updated_at DESC
-       LIMIT $2`,
-      [pattern, limit]
-    );
+    let rows = [];
+    if (cfg.provider === 'postgres') {
+      const pool = getPool(cfg.pgUrl);
+      await ensurePgSchema(pool);
+      const res = await pool.query(
+        `SELECT * FROM nova_tracks
+         WHERE title ILIKE $1 OR artist ILIKE $1
+         ORDER BY cue_votes DESC, updated_at DESC
+         LIMIT $2`,
+        [pattern, limit]
+      );
+      rows = res.rows;
+    } else {
+      await ensureTursoSchema(cfg);
+      [rows] = await tursoPipeline(cfg, [
+        {
+          sql: `SELECT * FROM nova_tracks WHERE title LIKE ? OR artist LIKE ? ORDER BY cue_votes DESC, updated_at DESC LIMIT ?`,
+          args: [pattern, pattern, limit],
+        },
+      ]);
+    }
     return rows.map((r) => ({
-      id: r.track_id,
-      source: r.source,
-      videoId: r.youtube_id,
-      title: r.title,
-      artist: r.artist,
-      artwork: r.artwork,
-      streamUrl: r.stream_url,
-      durationSec: r.duration_sec,
-      bpm: r.bpm,
-      key: r.musical_key,
-      camelot: r.camelot,
-      energy: r.energy,
-      entrySec: r.entry_sec,
-      exitSec: r.exit_sec,
-      playFull: r.play_full,
-      heat: r.heat_json,
-      sections: r.sections_json,
+      ...mapTrackRow(r),
       mixReady: Boolean(r.stream_url) || r.source === 'youtube',
       dspReady: Boolean(r.stream_url),
       provider: r.source === 'youtube' ? 'YouTube (Cached)' : r.source,
@@ -462,6 +661,23 @@ export async function getCachedPlaylist(playlistId, maxAgeHours = 24) {
         artwork: r.artwork,
         count: r.item_count,
         results: r.items_json,
+        cached: true,
+      };
+    }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      const [rows] = await tursoPipeline(cfg, [
+        { sql: `SELECT * FROM nova_playlists WHERE playlist_id = ? LIMIT 1`, args: [playlistId] },
+      ]);
+      if (!rows.length) return null;
+      const r = rows[0];
+      return {
+        playlistId: r.playlist_id,
+        title: r.title,
+        channel: r.channel,
+        artwork: r.artwork,
+        count: r.item_count,
+        results: safeParseJson(r.items_json, []),
         cached: true,
       };
     }
@@ -503,14 +719,29 @@ export async function saveCachedPlaylist(playlist) {
       );
       return true;
     }
-    if (cfg.provider === 'kv') {
-      await kvCmd(cfg, [
-        'SET',
-        `nova:playlist:${playlist.playlistId}`,
-        JSON.stringify(playlist),
-        'EX',
-        60 * 60 * 24,
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      await tursoPipeline(cfg, [
+        {
+          sql: `INSERT INTO nova_playlists (playlist_id, title, channel, artwork, item_count, items_json)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(playlist_id) DO UPDATE SET
+                  title=excluded.title, channel=excluded.channel, artwork=excluded.artwork,
+                  item_count=excluded.item_count, items_json=excluded.items_json, updated_at=CURRENT_TIMESTAMP`,
+          args: [
+            playlist.playlistId,
+            playlist.title || 'YouTube Playlist',
+            playlist.channel || 'YouTube',
+            playlist.artwork || '',
+            playlist.results?.length || 0,
+            JSON.stringify(playlist.results || []),
+          ],
+        },
       ]);
+      return true;
+    }
+    if (cfg.provider === 'kv') {
+      await kvCmd(cfg, ['SET', `nova:playlist:${playlist.playlistId}`, JSON.stringify(playlist), 'EX', 60 * 60 * 24]);
       return true;
     }
   } catch (err) {
@@ -564,6 +795,43 @@ export async function updateTrackCue(payload) {
       }
       return { persisted: true, provider: 'postgres' };
     }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      const stmts = [
+        {
+          sql: `INSERT INTO nova_cue_feedback (track_id, session_id, action, from_sec, to_sec, rating) VALUES (?,?,?,?,?,?)`,
+          args: [
+            String(payload.trackId),
+            String(payload.sessionId || 'anon'),
+            String(payload.action || 'cue'),
+            Number.isFinite(Number(payload.fromSec)) ? Number(payload.fromSec) : null,
+            Number.isFinite(Number(payload.toSec)) ? Number(payload.toSec) : null,
+            payload.rating ? String(payload.rating) : null,
+          ],
+        },
+      ];
+      if (Number.isFinite(Number(payload.entrySec)) || Number.isFinite(Number(payload.exitSec))) {
+        stmts.push({
+          sql: `UPDATE nova_tracks
+                SET entry_sec = COALESCE(?, entry_sec), exit_sec = COALESCE(?, exit_sec),
+                    bpm = COALESCE(?, bpm), musical_key = COALESCE(?, musical_key),
+                    camelot = COALESCE(?, camelot), heat_json = COALESCE(?, heat_json),
+                    cue_votes = cue_votes + 1, cue_confidence = 'user', updated_at = CURRENT_TIMESTAMP
+                WHERE track_id = ?`,
+          args: [
+            Number.isFinite(Number(payload.entrySec)) ? Number(payload.entrySec) : null,
+            Number.isFinite(Number(payload.exitSec)) ? Number(payload.exitSec) : null,
+            Number.isFinite(Number(payload.bpm)) ? Number(payload.bpm) : null,
+            payload.key || null,
+            payload.camelot || null,
+            payload.heat ? JSON.stringify(payload.heat) : null,
+            String(payload.trackId),
+          ],
+        });
+      }
+      await tursoPipeline(cfg, stmts);
+      return { persisted: true, provider: 'turso' };
+    }
     if (cfg.provider === 'kv') {
       const existingRaw = await kvCmd(cfg, ['GET', `nova:track:${payload.trackId}`]);
       if (existingRaw) {
@@ -610,6 +878,26 @@ export async function listSavedSets(sessionId) {
         })),
       };
     }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      const [rows] = await tursoPipeline(cfg, [
+        {
+          sql: `SELECT id, session_id, name, vibe_json, tracks_json, created_at FROM nova_sets
+                WHERE session_id = ? OR session_id = 'public' ORDER BY created_at DESC LIMIT 30`,
+          args: [String(sessionId || 'anon')],
+        },
+      ]);
+      return {
+        persisted: true,
+        sets: rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          vibe: safeParseJson(r.vibe_json, {}),
+          tracks: safeParseJson(r.tracks_json, []),
+          createdAt: r.created_at,
+        })),
+      };
+    }
     if (cfg.provider === 'kv') {
       const raw = await kvCmd(cfg, ['GET', `nova:sets:${sessionId || 'anon'}`]);
       return { persisted: true, sets: raw ? JSON.parse(raw) : [] };
@@ -644,6 +932,23 @@ export async function saveSetRecord(setObj) {
       );
       return { persisted: true, set: setObj };
     }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      await tursoPipeline(cfg, [
+        {
+          sql: `INSERT INTO nova_sets (id, session_id, name, vibe_json, tracks_json) VALUES (?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name, vibe_json=excluded.vibe_json, tracks_json=excluded.tracks_json`,
+          args: [
+            String(setObj.id),
+            String(setObj.sessionId || 'anon'),
+            String(setObj.name || 'NOVA Set'),
+            JSON.stringify(setObj.vibe || {}),
+            JSON.stringify(setObj.tracks || []),
+          ],
+        },
+      ]);
+      return { persisted: true, set: setObj };
+    }
     if (cfg.provider === 'kv') {
       const key = `nova:sets:${setObj.sessionId || 'anon'}`;
       const raw = await kvCmd(cfg, ['GET', key]);
@@ -668,6 +973,16 @@ export async function deleteSetRecord(id, sessionId) {
       await pool.query('DELETE FROM nova_sets WHERE id = $1 AND session_id = $2', [
         String(id),
         String(sessionId || 'anon'),
+      ]);
+      return { deleted: true };
+    }
+    if (cfg.provider === 'turso') {
+      await ensureTursoSchema(cfg);
+      await tursoPipeline(cfg, [
+        {
+          sql: `DELETE FROM nova_sets WHERE id = ? AND session_id = ?`,
+          args: [String(id), String(sessionId || 'anon')],
+        },
       ]);
       return { deleted: true };
     }

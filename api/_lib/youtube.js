@@ -1,6 +1,6 @@
 const JUNK_PARENS = /^(?:feat\.?|ft\.?|featuring|from|official|video|audio|lyrics?|lyrical|full\s+song|full\s+video|4k|hd|hq|original\s+motion\s+picture(?:\s+soundtrack)?|video\s+song|audio\s+song|music\s+video)\b/i;
 const LANG_ONLY_PARENS = /^(?:hindi|punjabi|english|tamil|telugu|gujarati|bhojpuri|haryanvi|marathi|bengali|kannada|malayalam)(?:\s*[+/&,]\s*(?:hindi|punjabi|english|tamil|telugu|gujarati|bhojpuri|haryanvi|marathi|bengali|kannada|malayalam))*(?:\s+(?:version|ver\.?))?$/i;
-const TRAILING_TAGS = /\s*(?:\||::|—|-)\s*(?:official\s+(?:music\s+)?(?:video|audio|song)|full\s+(?:video|song|audio)|lyrical(?:\s+video)?|t-series|zee music|yrf|sony music|tips official|speed records|saregama).*$/i;
+const TRAILING_TAGS = /\s*(?:\||::|—|-)\s*(?:official\s+(?:music\s+)?(?:video|audio|song)|full\s+(?:video|song|audio)|lyrical(?:\s+video)?|4k(?:\s+video)?|hd\s+video|t-series|zee music|yrf|sony music|tips official|speed records|saregama).*$/i;
 
 const PUBLIC_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -112,7 +112,8 @@ export function parseYouTubeInput(input) {
 
 function makeTrack({ videoId, rawTitle, channelTitle, durationSec, artwork }) {
   const { title, artist } = cleanTrackMetadata(rawTitle, channelTitle);
-  const safeDur = Math.max(30, Number(durationSec) || 210);
+  const rawDur = Number(durationSec) || 0;
+  const safeDur = rawDur >= 20 && rawDur <= 3600 ? rawDur : 210;
   const defaultEntry = Math.min(Math.round(safeDur * 0.22), 45);
   const defaultExit = Math.min(safeDur - 3, Math.max(defaultEntry + 42, Math.round(safeDur * 0.78)));
 
@@ -331,14 +332,59 @@ export async function fetchSingleYouTubeTrack(videoId, apiKey) {
 /* =====================================================================
    PUBLIC YOUTUBE EXTRACTOR FALLBACK (Zero API Key / Quota Fallback)
    ===================================================================== */
-function extractInitialData(html) {
-  const m = html.match(/var ytInitialData = (\{.+?\});<\/script>/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return null;
+function extractJsonObjectAfter(html, markers) {
+  for (const marker of markers) {
+    const idx = html.indexOf(marker);
+    if (idx === -1) continue;
+    const start = html.indexOf('{', idx + marker.length);
+    if (start === -1) continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < html.length; i++) {
+      const ch = html[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else {
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            try {
+              return JSON.parse(html.slice(start, i + 1));
+            } catch {
+              break;
+            }
+          }
+        }
+      }
+    }
   }
+  return null;
+}
+
+function extractInitialData(html) {
+  return extractJsonObjectAfter(html, [
+    'var ytInitialData =',
+    'window["ytInitialData"] =',
+    'ytInitialData =',
+  ]);
+}
+
+function extractPlayerResponse(html) {
+  return extractJsonObjectAfter(html, [
+    'var ytInitialPlayerResponse =',
+    'window["ytInitialPlayerResponse"] =',
+    'ytInitialPlayerResponse =',
+  ]);
+}
+
+function extractInnertubeKey(html) {
+  const m = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : '';
 }
 
 export async function searchYouTubePublic(query, limit = 15) {
@@ -386,10 +432,12 @@ export async function fetchYouTubePlaylistPublic(playlistId, maxItems = 150) {
     headers: PUBLIC_HEADERS,
   });
   if (!res.ok) throw new Error(`YouTube playlist HTTP ${res.status}`);
-  const data = extractInitialData(await res.text());
+  const html = await res.text();
+  const data = extractInitialData(html);
   if (!data) throw new Error('Could not parse public playlist page.');
 
   const playlistTitle = data?.metadata?.playlistMetadataRenderer?.title || 'YouTube Playlist';
+  const innertubeKey = extractInnertubeKey(html);
   const tracks = [];
   const seen = new Set();
 
@@ -407,6 +455,7 @@ export async function fetchYouTubePlaylistPublic(playlistId, maxItems = 150) {
     );
   };
 
+  let nextToken = null;
   const walk = (node) => {
     if (!node || typeof node !== 'object' || tracks.length >= maxItems) return;
     if (node.playlistVideoRenderer?.videoId) {
@@ -431,10 +480,36 @@ export async function fetchYouTubePlaylistPublic(playlistId, maxItems = 150) {
       pushTrack(l.contentId, rawTitle, channel, badge, thumbs[thumbs.length - 1]?.url);
       return;
     }
+    if (!nextToken && node.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token) {
+      nextToken = node.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+    }
     if (Array.isArray(node)) node.forEach(walk);
     else Object.values(node).forEach(walk);
   };
   walk(data.contents);
+
+  // Follow public continuation tokens for >100 item playlists
+  let pageCount = 0;
+  while (nextToken && innertubeKey && tracks.length < maxItems && pageCount < 3) {
+    pageCount++;
+    const token = nextToken;
+    nextToken = null;
+    try {
+      const cRes = await fetch(`https://www.youtube.com/youtubei/v1/browse?key=${encodeURIComponent(innertubeKey)}`, {
+        method: 'POST',
+        headers: { ...PUBLIC_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          context: { client: { clientName: 'WEB', clientVersion: '2.20240701.00.00' } },
+          continuation: token,
+        }),
+      });
+      if (!cRes.ok) break;
+      const cData = await cRes.json();
+      walk(cData.onResponseReceivedActions || cData.contents);
+    } catch {
+      break;
+    }
+  }
 
   // If playlist page didn't expose renderers (e.g. Mix RD... or Watch playlist), fetch /watch?list=...
   if (!tracks.length) {
@@ -475,6 +550,27 @@ export async function fetchYouTubePlaylistPublic(playlistId, maxItems = 150) {
 }
 
 export async function fetchSingleYouTubePublic(videoId) {
+  try {
+    const watchRes = await fetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
+      headers: PUBLIC_HEADERS,
+    });
+    if (watchRes.ok) {
+      const player = extractPlayerResponse(await watchRes.text());
+      const vd = player?.videoDetails;
+      if (vd?.title) {
+        const thumbs = vd.thumbnail?.thumbnails || [];
+        const lenSec = vd.isLiveContent ? 210 : (Number(vd.lengthSeconds) || 210);
+        return makeTrack({
+          videoId,
+          rawTitle: vd.title,
+          channelTitle: vd.author || 'YouTube',
+          durationSec: lenSec,
+          artwork: thumbs[thumbs.length - 1]?.url,
+        });
+      }
+    }
+  } catch {}
+
   const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`;
   const res = await fetch(url);
   if (!res.ok) {

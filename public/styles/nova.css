@@ -526,6 +526,11 @@ button {
   font-size: 24px;
   letter-spacing: 0.03em;
   color: var(--bone);
+  cursor: pointer;
+}
+.crate-floating-pill:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .floating-next-btn {
@@ -787,6 +792,7 @@ button {
   font-family: var(--font-display);
   font-size: clamp(20px, 2vw, 32px);
   line-height: 1;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
   color: rgba(245, 245, 240, 0.72);
 }
@@ -864,10 +870,18 @@ button {
 
 @media (max-width: 767px) {
   .deck[data-slot="cue"] {
-    transform: translateY(calc(100cqh - 62%)) scale(0.62);
+    transform: translate3d(0, calc(100cqh - 54%), 0) scale(0.62);
   }
   .deck[data-slot="out"] {
-    transform: translateY(-12vh) scale(0.94);
+    transform: translate3d(0, -12vh, 0) scale(0.94);
+  }
+  .deck[data-slot="enter"] {
+    transform: translate3d(0, 120%, 0) scale(0.62);
+  }
+  .drag-hint-bubble {
+    font-size: 11px;
+    padding: 0 10px;
+    gap: 5px;
   }
 }
 
@@ -947,7 +961,7 @@ button {
 }
 
 .deck-pip-slot {
-  width: max(300px, 17vw);
+  width: clamp(128px, 17vw, 320px);
   aspect-ratio: 16 / 9;
   border-radius: 20px;
   flex-shrink: 0;
@@ -1148,6 +1162,64 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@media (max-width: 767px) {
+  .play-stage {
+    padding: 2vh 4vw 2.4vh;
+  }
+  .play-topbar {
+    gap: 6px;
+  }
+  .play-topbar-right {
+    gap: 6px;
+  }
+  .wordmark {
+    font-size: 24px;
+  }
+  .clock-pill {
+    padding: 6px 10px;
+    gap: 6px;
+    font-size: 15px;
+  }
+  .mixer-toggle-btn {
+    height: 36px;
+    padding: 0 10px;
+    font-size: 15px;
+  }
+  .exit-btn {
+    height: 36px;
+    min-width: 36px;
+    font-size: 16px;
+  }
+  .agent-bar {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 0;
+    margin-bottom: 1.6vh;
+  }
+  .agent-msg {
+    flex-basis: calc(100% - 78px);
+    font-size: 18px;
+  }
+  .agent-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .agent-pill {
+    padding: 6px 12px;
+    font-size: 15px;
+  }
+  .crate-floating-pill {
+    height: 54px;
+    padding: 0 14px;
+    font-size: 18px;
+  }
+  .floating-next-btn {
+    height: 60px;
+    padding: 0 24px;
+    font-size: 28px;
+  }
 }
 
 .agent-actions {

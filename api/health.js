@@ -1,19 +1,25 @@
 import { handlePreflight, sendJson } from './_lib/http.js';
 import { getDbHealth } from './_lib/db.js';
+import { sanitizeApiKey } from './_lib/youtube.js';
 
 export default async function handler(req, res) {
   if (handlePreflight(req, res)) return;
   const db = await getDbHealth();
+  const ytKey = sanitizeApiKey(process.env.YOUTUBE_API_KEY);
+  const validYtKey = ytKey.length >= 20 && /^AIza/i.test(ytKey);
+
   return sendJson(res, 200, {
     ok: true,
     service: 'NOVA AI DJ v2',
-    version: 'supernova-2.0',
-    youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+    version: 'supernova-2.1',
+    youtubeConfigured: Boolean(ytKey),
+    youtubeMode: validYtKey ? 'data-api-v3+public-fallback' : 'public-extractor',
     audioWorkerConfigured: Boolean(process.env.AUDIO_WORKER_URL),
     database: db,
     capabilities: [
       'youtube-search',
       'youtube-playlist-import',
+      'youtube-continuation-pagination',
       'dual-deck-youtube-iframe',
       'essentia-wasm-beatgrid-key',
       'signalsmith-pitch-preserving-stretch',

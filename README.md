@@ -11,15 +11,16 @@ NOVA is an autonomous browser & dual-deck AI DJ mixing studio styled around brut
    - **Studio-Transparent 4-Band Isolator (`stems-isolator.js`)**: Zero-latency real-time stem controls (`Vocals`, `Drums`, `Bass`, `Air`) + sweepable HPF/LPF color filter, tempo-synced ping-pong echo, algorithmic reverb, synthesized percussion bridge, and live `.webm` mix recording.
    - **8 Club Transition Choreographies**: `BASS_SWAP_16BAR`, `STEM_VOCAL_PASS`, `DROP_SWAP`, `TENSION_ROLL_DROP`, `ECHO_OUT_BRAKE`, `HARMONIC_BLEND`, `BREAKDOWN_BRIDGE`, `PERCUSSION_BRIDGE`.
 2. **Dual-Deck YouTube Engine (`public/js/engine/youtube-deck-engine.js`)** — runs on YouTube search results, single links, and imported playlists:
-   - Imports full YouTube playlists (`youtube/v3/playlistItems` paginated up to 150 tracks) and searches embeddable music videos via `YOUTUBE_API_KEY`.
-   - Dual pre-cued YouTube IFrame decks (`yt-deck-A` / `yt-deck-B`) with equal-power `sin/cos` crossfade, optional PIP video preview, and interactive drag-to-seek cue learning.
+   - Imports full YouTube playlists (up to 150 tracks via Data API v3 or public continuation fallback) and searches embeddable music videos seamlessly even when `YOUTUBE_API_KEY` is omitted or invalid.
+   - Dual pre-cued YouTube IFrame decks (`yt-deck-A` / `yt-deck-B`) with 4 blend modes (`PHRASE BLEND`, `SWEEP CUT`, `DRUM BRIDGE`, `ECHO DROP`), synchronized Web Audio transition FX accents, optional PIP video preview, and interactive drag-to-seek cue learning.
 
 ### Database Persistence (`api/_lib/db.js`)
-Auto-detects connected Vercel database integrations without extra setup:
-- **Postgres** (`POSTGRES_URL`, `DATABASE_URL`, `NEON_DATABASE_URL`, `POSTGRES_PRISMA_URL`) with auto-created tables (`nova_tracks`, `nova_playlists`, `nova_sets`, `nova_cue_feedback`)
-- **Supabase REST** (`SUPABASE_URL` + key)
-- **Vercel KV / Upstash Redis** (`KV_REST_API_URL` + token)
-- Falls back gracefully to browser `localStorage` when running offline.
+Auto-detects connected Vercel database integrations across custom Marketplace prefixes without extra setup:
+- **Postgres** (`POSTGRES_URL`, `DATABASE_URL`, `NEON_DATABASE_URL`, `POSTGRES_PRISMA_URL`, `DATABASE_URL_POOLED`, `*_POSTGRES_URL`, `*_DATABASE_URL`) with auto-created tables (`nova_tracks`, `nova_playlists`, `nova_sets`, `nova_cue_feedback`)
+- **Supabase REST** (`SUPABASE_URL` / `*_SUPABASE_URL` + key)
+- **Vercel KV / Upstash Redis** (`KV_REST_API_URL` / `UPSTASH_REDIS_REST_URL` + token)
+- **Turso / libSQL** (`TURSO_DATABASE_URL` / `LIBSQL_URL` + auth token)
+- Falls back gracefully to browser `localStorage` for sets and learned cues when running offline.
 
 ## Commands
 

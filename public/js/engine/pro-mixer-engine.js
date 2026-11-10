@@ -208,7 +208,7 @@ export class ProMixerEngine {
       throw new Error('Track has no decodable local file or CORS stream.');
     }
 
-    const buffer = await this.ctx.decodeAudioData(bytes.slice(0));
+    const buffer = await this.ctx.decodeAudioData(bytes);
     if (buffer.duration < 10) throw new Error('Track is shorter than 10 seconds.');
 
     onProgress?.(`Analyzing beatgrid, key & structure for ${track.title}…`);
@@ -292,7 +292,7 @@ export class ProMixerEngine {
     if (this.ctx.state === 'suspended') {
       try { await this.ctx.resume(); } catch {}
     }
-    const t = when ?? this.ctx.currentTime + 0.04;
+    const t = when ?? this.ctx.currentTime + 0.14;
     const pos = Math.max(0, Math.min(deck.buffer.duration - 0.5, offsetSec ?? deck.position));
 
     deck.rate = rate;
@@ -336,13 +336,22 @@ export class ProMixerEngine {
     deck.playing = false;
     deck.loopActive = false;
     const now = this.ctx ? this.ctx.currentTime : 0;
+    const t = now + 0.03;
     if (deck.stretch) {
       try {
-        await deck.stretch.schedule({ output: now + 0.02, outputTime: now + 0.02, active: false, loopStart: 0, loopEnd: 0 });
+        await deck.stretch.schedule({
+          output: t,
+          outputTime: t,
+          active: false,
+          rate: 1,
+          semitones: 0,
+          loopStart: 0,
+          loopEnd: 0,
+        });
       } catch {}
     }
     if (deck.fallbackSource) {
-      try { deck.fallbackSource.stop(now + 0.02); } catch {}
+      try { deck.fallbackSource.stop(t); } catch {}
       deck.fallbackSource = null;
     }
   }
@@ -352,8 +361,9 @@ export class ProMixerEngine {
     if (!deck || !deck.playing) return;
     deck.position = this.getDeckPosition(deckId);
     deck.playing = false;
+    const t = this.ctx.currentTime + 0.03;
     if (deck.stretch) {
-      await deck.stretch.schedule({ output: this.ctx.currentTime + 0.02, outputTime: this.ctx.currentTime + 0.02, active: false });
+      await deck.stretch.schedule({ output: t, outputTime: t, active: false });
     } else if (deck.fallbackSource) {
       try { deck.fallbackSource.stop(); } catch {}
       deck.fallbackSource = null;
@@ -484,10 +494,21 @@ export class ProMixerEngine {
     const maxSafeSec = Math.max(2.5, Math.min(28, outPlayable * 0.48));
     const durationSec = Math.min(maxSafeSec, Math.max(2.5, bars * 4 * beatSec));
 
-    // Align incoming entry precisely to next downbeat
-    const inOffset = inDeck.track?.playFull
+    // Align incoming entry precisely to Deck B's nearest Bar 1 downbeat for exact beat-phase lock!
+    const rawEntry = inDeck.track?.playFull
       ? (b?.downbeats?.[0] || 0)
       : (inDeck.track?.entrySec ?? b?.clubEntry ?? 0);
+    const inDownbeats = b?.downbeats?.length ? b.downbeats : b?.beats || [];
+    let inOffset = rawEntry;
+    if (inDownbeats.length && inDeck.track?.cueConfidence !== 'user') {
+      const snapped = inDownbeats.reduce((best, d) =>
+        Math.abs(d - rawEntry) < Math.abs(best - rawEntry) ? d : best,
+        inDownbeats[0]
+      );
+      if (Math.abs(snapped - rawEntry) <= Math.max(2.5, beatSec * 4)) {
+        inOffset = snapped;
+      }
+    }
 
     return {
       style,
@@ -514,13 +535,13 @@ export class ProMixerEngine {
     if (!outDeck || !inDeck || !inDeck.buffer) return;
 
     const now = this.ctx.currentTime;
-    // Quantize transition start to outgoing Beat 1 (or next beat within 1.5s)
-    let startAt = now + 0.08;
+    // Quantize transition start to outgoing Beat 1 (with >= 0.16s headroom so SignalsmithStretch latency-compensates cleanly)
+    let startAt = now + 0.16;
     const outPos = this.getDeckPosition(outDeckId);
     const grid = outDeck.analysis?.downbeats?.length ? outDeck.analysis.downbeats : outDeck.analysis?.beats || [];
-    const nextBeat = grid.find((b) => b >= outPos + 0.06 && b <= outPos + 2.2);
+    const nextBeat = grid.find((b) => b >= outPos + 0.16 && b <= outPos + 2.4);
     if (nextBeat !== undefined) {
-      startAt = now + (nextBeat - outPos) / Math.max(0.5, outDeck.rate);
+      startAt = Math.max(now + 0.16, now + (nextBeat - outPos) / Math.max(0.5, outDeck.rate));
     }
 
     const dur = plan.durationSec;
@@ -591,6 +612,8 @@ export class ProMixerEngine {
       outDeck.strip.echoSend.gain.setValueAtTime(0, startAt);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0.45, startAt + dur * 0.65);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
+      this.echoFeedback.gain.setValueAtTime(0.46, startAt);
+      this.echoFeedback.gain.setValueAtTime(0.36, endAt);
 
       inDeck.strip.setStem('bass', 0.05, startAt, 0.02);
       inGain.setValueAtTime(0.001, startAt);
@@ -602,17 +625,21 @@ export class ProMixerEngine {
       outGain.linearRampToValueAtTime(0.0001, startAt + dur * 0.76);
     } else if (style === 'TENSION_ROLL_DROP') {
       // 4-bar beat roll tension on Deck A (loop last 1 bar -> half bar) + filter rise -> slam B
-      const posA = this.getDeckPosition(outDeckId);
+      const rollAnchor = outPos + (startAt - now) * Math.max(0.5, outDeck.rate);
       if (outDeck.stretch) {
+        const t1 = startAt;
+        const t2 = startAt + dur * 0.5;
         outDeck.stretch.schedule({
-          output: startAt,
-          loopStart: Math.max(0, posA - beatSec * 2),
-          loopEnd: Math.max(0.2, posA),
+          output: t1,
+          outputTime: t1,
+          loopStart: Math.max(0, rollAnchor - beatSec * 2),
+          loopEnd: Math.max(0.2, rollAnchor),
         });
         outDeck.stretch.schedule({
-          output: startAt + dur * 0.5,
-          loopStart: Math.max(0, posA - beatSec),
-          loopEnd: Math.max(0.1, posA),
+          output: t2,
+          outputTime: t2,
+          loopStart: Math.max(0, rollAnchor - beatSec),
+          loopEnd: Math.max(0.1, rollAnchor),
         });
       }
       outDeck.strip.setColorFilter(0.82, startAt, dur * 0.75);
@@ -631,8 +658,11 @@ export class ProMixerEngine {
       outDeck.strip.echoSend.gain.setValueAtTime(0, startAt);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0.55, startAt + dur * 0.45);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
+      this.echoFeedback.gain.setValueAtTime(0.5, startAt);
+      this.echoFeedback.gain.setValueAtTime(0.36, endAt);
       if (outDeck.stretch) {
-        outDeck.stretch.schedule({ output: startAt + dur * 0.3, rate: 0.78, semitones: -4 });
+        const brakeAt = startAt + dur * 0.3;
+        outDeck.stretch.schedule({ output: brakeAt, outputTime: brakeAt, rate: 0.78, semitones: -4 });
       }
       outGain.setValueAtTime(1.0, startAt);
       outGain.linearRampToValueAtTime(0.0001, startAt + dur * 0.65);
@@ -718,6 +748,67 @@ export class ProMixerEngine {
     };
   }
 
+  async playTransitionSweepFx({ type = 'sweep', bpm = 122, durationSec = 4.0 } = {}) {
+    try {
+      await this.ensureContext();
+    } catch {
+      return;
+    }
+    const now = this.ctx.currentTime + 0.04;
+    if (type === 'drum_bridge') {
+      const bars = Math.max(1, Math.min(4, Math.round(durationSec / ((60 / Math.max(80, bpm)) * 4))));
+      this.#schedulePercussionBridge(now, bpm, bars);
+      return;
+    }
+
+    // Subtle analog filter riser + clean sub impact thump at the mix handover point
+    const len = Math.floor(this.ctx.sampleRate * Math.min(6, durationSec));
+    const noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const ch = noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = noiseBuf;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = type === 'echo_drop' ? 3.2 : 2.1;
+    bp.frequency.setValueAtTime(240, now);
+    bp.frequency.exponentialRampToValueAtTime(5800, now + durationSec * 0.62);
+    bp.frequency.exponentialRampToValueAtTime(160, now + durationSec * 0.96);
+
+    const g = this.ctx.createGain();
+    const peakGain = type === 'phrase' ? 0.045 : 0.085;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peakGain, now + durationSec * 0.58);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + durationSec * 0.95);
+
+    noise.connect(bp);
+    bp.connect(g);
+    g.connect(this.masterFilter);
+    if (type === 'echo_drop') {
+      g.connect(this.echoDelayL);
+    }
+    noise.start(now);
+    noise.stop(now + durationSec);
+
+    // Subtle warm 808 sub impact on the incoming downbeat (at 62% of blend)
+    if (type !== 'phrase') {
+      const dropAt = now + durationSec * 0.62;
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(92, dropAt);
+      osc.frequency.exponentialRampToValueAtTime(38, dropAt + 0.42);
+      const og = this.ctx.createGain();
+      og.gain.setValueAtTime(0.0001, dropAt);
+      og.gain.linearRampToValueAtTime(0.18, dropAt + 0.015);
+      og.gain.exponentialRampToValueAtTime(0.0001, dropAt + 0.55);
+      osc.connect(og);
+      og.connect(this.masterFilter);
+      osc.start(dropAt);
+      osc.stop(dropAt + 0.6);
+    }
+  }
+
   setMasterFilter(hz) {
     if (!this.masterFilter) return;
     this.masterFilter.frequency.setTargetAtTime(Math.max(160, Math.min(20000, hz)), this.ctx.currentTime, 0.03);
@@ -726,13 +817,17 @@ export class ProMixerEngine {
   setDeckEcho(deckId, amount) {
     const deck = this.decks[deckId];
     if (!deck) return;
-    deck.strip.echoSend.gain.setTargetAtTime(Math.max(0, Math.min(0.85, amount)), this.ctx.currentTime, 0.04);
+    const now = this.ctx.currentTime;
+    deck.strip.echoSend.gain.cancelScheduledValues(now);
+    deck.strip.echoSend.gain.setTargetAtTime(Math.max(0, Math.min(0.85, amount)), now, 0.04);
   }
 
   setDeckReverb(deckId, amount) {
     const deck = this.decks[deckId];
     if (!deck) return;
-    deck.strip.reverbSend.gain.setTargetAtTime(Math.max(0, Math.min(0.85, amount)), this.ctx.currentTime, 0.04);
+    const now = this.ctx.currentTime;
+    deck.strip.reverbSend.gain.cancelScheduledValues(now);
+    deck.strip.reverbSend.gain.setTargetAtTime(Math.max(0, Math.min(0.85, amount)), now, 0.04);
   }
 
   toggleRecording() {

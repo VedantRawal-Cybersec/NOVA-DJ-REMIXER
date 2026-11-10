@@ -120,6 +120,8 @@ export class NovaOrchestrator {
     this.onUpdate = onUpdate;
     this.proMixer = new ProMixerEngine();
     this.ytEngine = new YouTubeDeckEngine(ytHostEl, {
+      onDeckReady: (deckId, track) => this.#handleYtReady(deckId, track),
+      onDeckLive: (deckId) => this.#emit(),
       onDeckError: (deckId, track, code) => this.#handleYtError(deckId, track, code),
       onTrackEnded: (deckId) => this.#handleDeckEnded(deckId),
     });
@@ -134,7 +136,9 @@ export class NovaOrchestrator {
 
     this.vibe = 'peak';
     this.playMode = 'club';
-    this.ytCrossfadeSec = 4;
+    this.ytCrossfadeSec = 5.5;
+    this.ytTransitionStyle = 'phrase'; // phrase | sweep_cut | drum_bridge | echo_drop
+    this.ytFxEnabled = true;
     this.running = false;
     this.paused = false;
     this.crossfading = false;
@@ -150,11 +154,13 @@ export class NovaOrchestrator {
     return Boolean(track && (track.file || (track.dspReady && track.streamUrl)));
   }
 
-  async startSet(tracks, { vibe = 'peak', playMode = 'club', ytCrossfadeSec = 4 } = {}) {
+  async startSet(tracks, { vibe = 'peak', playMode = 'club', ytCrossfadeSec = 5.5, ytTransitionStyle = 'phrase', ytFxEnabled = true } = {}) {
     this.stop();
     this.vibe = vibe;
     this.playMode = playMode;
     this.ytCrossfadeSec = ytCrossfadeSec;
+    this.ytTransitionStyle = ytTransitionStyle;
+    this.ytFxEnabled = ytFxEnabled;
     this.queue = tracks.slice();
     this.nextIndex = 0;
     this.playedHistory = [];
@@ -166,8 +172,8 @@ export class NovaOrchestrator {
     const hasYt = this.queue.some((t) => !this.#isDspTrack(t));
     const hasDsp = this.queue.some((t) => this.#isDspTrack(t));
 
-    if (hasDsp) {
-      await this.proMixer.ensureContext();
+    if (hasDsp || (hasYt && this.ytFxEnabled)) {
+      await this.proMixer.ensureContext().catch(() => {});
     }
     if (hasYt && !this.ytReady) {
       this.#setAgent('Connecting Dual YouTube Decks…');
@@ -278,16 +284,27 @@ export class NovaOrchestrator {
         this.ytReady = true;
       }
       this.ytEngine.load(deckId, track, 'preload', this.playMode);
-      slot.status = 'ready';
+      slot.status = 'loading';
       slot.duration = track.durationSec || 210;
       slot.cutAt = slot.playFull ? slot.duration - 2 : (track.exitSec ?? slot.duration - 16);
       this.transitionPlan = {
-        style: 'YOUTUBE_CROSSFADE',
+        style: `YOUTUBE_${this.ytTransitionStyle.toUpperCase()}`,
         durationSec: this.ytCrossfadeSec,
-        harmonic: { relation: 'phrase fade' },
+        harmonic: { relation: 'phrase blend' },
       };
     }
     this.#emit();
+  }
+
+  #handleYtReady(deckId, track) {
+    const slot = this.decks[deckId];
+    if (!slot || slot.track?.id !== track?.id) return;
+    if (slot.status === 'loading') {
+      slot.status = 'ready';
+      slot.duration = track.durationSec || slot.duration;
+      slot.cutAt = slot.playFull ? slot.duration - 2 : (track.exitSec ?? slot.duration - 16);
+      this.#emit();
+    }
   }
 
   #startTick() {
@@ -320,12 +337,12 @@ export class NovaOrchestrator {
       const remaining = liveSlot.cutAt - liveSlot.position;
       const transSec = this.transitionPlan?.durationSec || this.ytCrossfadeSec;
 
-      if (cueSlot.status === 'ready' && remaining <= transSec && remaining > -5) {
+      if ((cueSlot.status === 'ready' || (cueSlot.status === 'loading' && remaining <= 1.5)) && remaining <= transSec && remaining > -5) {
         this.triggerTransition('auto');
       } else if (cueSlot.status === 'empty' && remaining <= 3) {
         this.#endLastTrack(liveId);
       } else if (cueSlot.track && remaining <= transSec + 10 && remaining > transSec) {
-        const label = this.transitionPlan?.style?.replace(/_/g, ' ') || 'CROSSFADE';
+        const label = this.transitionPlan?.style?.replace(/_/g, ' ') || 'PHRASE BLEND';
         this.#setAgent(`${label} INTO ${cueSlot.track.title.toUpperCase()} IN ${Math.ceil(remaining - transSec)}S`);
       }
     }
@@ -364,20 +381,33 @@ export class NovaOrchestrator {
       await this.proMixer.stopDeck(outId);
       this.proMixer.masterBpm = (inSlot.track.bpm || 120) * (this.proMixer.decks[inId].rate || 1);
     } else if (outSlot.engine === 'yt' && inSlot.engine === 'yt') {
-      this.#setAgent(`CROSSFADING INTO ${inSlot.track.title.toUpperCase()}`);
+      const ytStyle = styleOverride || this.ytTransitionStyle || 'phrase';
+      this.#setAgent(`${ytStyle.replace(/_/g, ' ').toUpperCase()} INTO ${inSlot.track.title.toUpperCase()}`);
       this.#emit();
+
+      if (inSlot.status === 'loading') {
+        await this.ytEngine.waitForReady(inId, 5500);
+      }
       const started = await this.ytEngine.playPreloaded(inId);
       if (!started) {
         this.crossfading = false;
         return this.#handleYtError(inId, inSlot.track, 'start-timeout');
       }
-      await this.ytEngine.crossfade(outId, inId, this.ytCrossfadeSec * 1000);
+      if (this.ytFxEnabled) {
+        this.proMixer.playTransitionSweepFx({
+          type: ytStyle,
+          bpm: outSlot.track?.bpm || 122,
+          durationSec: this.ytCrossfadeSec,
+        });
+      }
+      await this.ytEngine.crossfade(outId, inId, this.ytCrossfadeSec * 1000, ytStyle);
     } else {
       // Hybrid Cross-Engine Handover (DSP <-> YouTube)!
       const fadeMs = 3200;
       this.#setAgent(`HYBRID BLEND INTO ${inSlot.track.title.toUpperCase()}`);
       this.#emit();
       if (inSlot.engine === 'yt') {
+        if (inSlot.status === 'loading') await this.ytEngine.waitForReady(inId, 5000);
         await this.ytEngine.playPreloaded(inId);
         const start = performance.now();
         await new Promise((res) => {
@@ -616,6 +646,12 @@ export class NovaOrchestrator {
     const live = this.decks[this.liveDeckId];
     const cueId = this.liveDeckId === 'A' ? 'B' : 'A';
     const cue = this.decks[cueId];
+    const livePos = live?.position || 0;
+    const ytBeatPhase = Math.pow(Math.max(0, Math.cos(livePos * Math.PI * (122 / 60))), 4);
+    const ytSpectrum = live?.track
+      ? { bass: 0.28 + ytBeatPhase * 0.52, mid: 0.42, overall: 0.35 + ytBeatPhase * 0.3 }
+      : { bass: 0, mid: 0, overall: 0 };
+
     return {
       running: this.running,
       paused: this.paused,
@@ -632,7 +668,7 @@ export class NovaOrchestrator {
       transitionPlan: this.transitionPlan,
       agentMessage: this.agentMessage,
       masterBpm: this.proMixer.masterBpm,
-      spectrum: live?.engine === 'dsp' ? this.proMixer.getSpectrumEnergy() : { bass: 0.4, mid: 0.4, overall: 0.4 },
+      spectrum: live?.engine === 'dsp' ? this.proMixer.getSpectrumEnergy() : ytSpectrum,
       remainingCount: Math.max(0, this.queue.length - this.nextIndex) + (cue?.track ? 1 : 0),
     };
   }

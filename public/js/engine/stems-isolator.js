@@ -105,15 +105,21 @@ export function createStemChannelStrip(ctx, destination) {
 
   function setColorFilter(norm, atTime = ctx.currentTime, rampSec = 0.03) {
     state.filter = Math.max(-1, Math.min(1, norm));
+    hpf.frequency.cancelScheduledValues(atTime);
+    hpf.Q.cancelScheduledValues(atTime);
+    lpf.frequency.cancelScheduledValues(atTime);
+    lpf.Q.cancelScheduledValues(atTime);
     if (state.filter < -0.02) {
       const amt = Math.abs(state.filter);
       const lpFreq = 20000 * Math.pow(220 / 20000, amt);
       hpf.frequency.setTargetAtTime(20, atTime, rampSec);
+      hpf.Q.setTargetAtTime(0.72, atTime, rampSec);
       lpf.frequency.setTargetAtTime(lpFreq, atTime, rampSec);
       lpf.Q.setTargetAtTime(0.72 + amt * 2.2, atTime, rampSec);
     } else if (state.filter > 0.02) {
       const hpFreq = 24 * Math.pow(5200 / 24, state.filter);
       lpf.frequency.setTargetAtTime(20000, atTime, rampSec);
+      lpf.Q.setTargetAtTime(0.72, atTime, rampSec);
       hpf.frequency.setTargetAtTime(hpFreq, atTime, rampSec);
       hpf.Q.setTargetAtTime(0.72 + state.filter * 2.2, atTime, rampSec);
     } else {
@@ -130,7 +136,9 @@ export function createStemChannelStrip(ctx, destination) {
     setStem('vocals', 1, atTime, 0.04);
     setStem('other', 1, atTime, 0.04);
     setColorFilter(0, atTime, 0.04);
+    echoSend.gain.cancelScheduledValues(atTime);
     echoSend.gain.setTargetAtTime(0, atTime, 0.04);
+    reverbSend.gain.cancelScheduledValues(atTime);
     reverbSend.gain.setTargetAtTime(0, atTime, 0.04);
   }
 

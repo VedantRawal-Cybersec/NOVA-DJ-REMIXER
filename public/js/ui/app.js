@@ -97,6 +97,7 @@ const state = {
   exitConfirm: false,
   exitTimer: null,
   drawerOpen: false,
+  crateModalOpen: false,
   vibeModalOpen: false,
   playNextModalOpen: false,
   playNextQuery: '',
@@ -116,7 +117,9 @@ const state = {
   loopActive: false,
   masterTempo: true,
   percussionBridge: false,
-  ytCrossfadeSec: 4,
+  ytCrossfadeSec: 5.5,
+  ytTransitionStyle: 'phrase',
+  ytFxEnabled: true,
   recording: false,
   setSavedMsg: '',
   setNameInput: '',
@@ -228,18 +231,57 @@ function persistLocalSet(setObj) {
   } catch {}
 }
 
+function getLearnedCueMap() {
+  try {
+    return JSON.parse(localStorage.getItem('nova.learned.cues.v2') || '{}');
+  } catch {
+    return {};
+  }
+}
+
 function addTrackToCrate(track) {
   if (!track || !track.id) return false;
   if (state.crate.some((t) => t.id === track.id)) return false;
-  state.crate.push({ ...track, heat: buildFallbackHeat(track) });
+  const learned = getLearnedCueMap()[track.id];
+  const merged = learned
+    ? { ...track, entrySec: learned.entrySec ?? track.entrySec, playFull: learned.playFull ?? track.playFull, cueConfidence: 'user' }
+    : track;
+  state.crate.push({ ...merged, heat: buildFallbackHeat(merged) });
   return true;
 }
 
 async function handleSourceFetch(overrideQuery = null) {
   const q = String(overrideQuery ?? state.searchInput).trim();
   if (!q) {
-    state.searchStatus = 'Paste a YouTube playlist URL, song link, or type a track/artist.';
+    state.searchStatus = 'Paste a YouTube playlist URL, song link, direct audio URL, or type a track/artist.';
     state.searchError = true;
+    render();
+    return;
+  }
+
+  // Direct CORS audio file URL support (.mp3 / .wav / .flac / .m4a / .ogg)
+  if (/^https?:\/\/.+\.(?:mp3|wav|flac|m4a|ogg|aac)(?:\?.*)?$/i.test(q)) {
+    const cleanFile = q.split('?')[0].split('/').pop() || 'Audio Stream';
+    const track = {
+      id: `url-${btoa(q).replace(/[^a-z0-9]/gi, '').slice(0, 18)}`,
+      source: 'stream',
+      provider: 'Direct Audio · Full DSP',
+      playback: 'web-audio-dsp',
+      mixReady: true,
+      dspReady: true,
+      title: decodeURIComponent(cleanFile).replace(/\.[^.]+$/, ''),
+      artist: new URL(q).hostname,
+      streamUrl: q,
+      durationSec: 180,
+      energy: 7,
+      entrySec: 8,
+      exitSec: 165,
+      playFull: false,
+    };
+    addTrackToCrate(track);
+    state.searchResults = [track];
+    state.searchError = false;
+    state.searchStatus = `Added direct audio stream "${track.title}" to crate (Full DSP enabled).`;
     render();
     return;
   }
@@ -419,6 +461,8 @@ async function approveAndPlay() {
     vibe: state.vibe,
     playMode: state.playMode,
     ytCrossfadeSec: state.ytCrossfadeSec,
+    ytTransitionStyle: state.ytTransitionStyle,
+    ytFxEnabled: state.ytFxEnabled,
   });
 }
 
@@ -428,6 +472,12 @@ async function saveCueAdjustment(track, toSec, playFull) {
   track.entrySec = Math.round(toSec);
   track.cueConfidence = 'user';
   if (playFull) track.playFull = true;
+
+  try {
+    const map = getLearnedCueMap();
+    map[track.id] = { entrySec: track.entrySec, playFull: Boolean(track.playFull), updatedAt: Date.now() };
+    localStorage.setItem('nova.learned.cues.v2', JSON.stringify(map));
+  } catch {}
 
   try {
     await fetch('/api/cues', {
@@ -547,6 +597,14 @@ function syncPlayingDom() {
     if (cueArt) cueArt.textContent = cueSlot.track.artist || '';
   }
 
+  const cueStatus = document.getElementById('cue-deck-status');
+  if (cueStatus) {
+    const label = cueSlot?.track
+      ? (cueSlot.status === 'ready' ? '○ READY' : '○ CUEING')
+      : '○ STANDBY';
+    if (cueStatus.textContent !== label) cueStatus.textContent = label;
+  }
+
   // Update 88-bar waveform progress on live deck
   const wf = document.querySelector('.deck[data-slot="live"] .waveform-bars');
   if (wf) {
@@ -560,7 +618,7 @@ function syncPlayingDom() {
       const played = barTime <= pos;
       const cls = !inside ? 'wave-bar outside' : played ? 'wave-bar played' : 'wave-bar';
       if (bars[i].className !== cls) bars[i].className = cls;
-      if (played && inside && liveSlot.engine === 'dsp') {
+      if (played && inside) {
         bars[i].style.transform = `scaleY(${bassPulse.toFixed(2)})`;
       } else if (bars[i].style.transform) {
         bars[i].style.transform = '';
@@ -574,7 +632,7 @@ function syncPlayingDom() {
   }
 
   const aura = document.getElementById('pulse-aura');
-  if (aura && liveSlot?.engine === 'dsp') {
+  if (aura) {
     const scale = 1 + (snap.spectrum?.bass || 0) * 0.16;
     aura.style.transform = `scale(${scale.toFixed(3)})`;
   }
@@ -763,7 +821,7 @@ function renderWizard() {
 
   const floatingNext = (step === 0 || step === 1) ? `
     <div class="floating-next-wrap">
-      ${state.crate.length ? `<div class="crate-floating-pill"><span>${state.crate.length}</span> TRACKS READY</div>` : '<div></div>'}
+      ${state.crate.length ? `<button id="btn-open-crate" class="crate-floating-pill squeeze" title="Inspect &amp; edit crate"><span>${state.crate.length}</span> TRACKS READY ▾</button>` : '<div></div>'}
       <button id="btn-wiz-next" class="floating-next-btn squeeze" ${canNext ? '' : 'disabled'}>NEXT →</button>
     </div>
   ` : '';
@@ -775,9 +833,35 @@ function renderWizard() {
     </main>
     ${floatingNext}
     ${state.setsModalOpen ? renderSetsModal() : ''}
+    ${state.crateModalOpen ? renderCrateModal() : ''}
   `;
 
   bindWizardEvents();
+}
+
+function renderCrateModal() {
+  return `
+    <div class="modal-backdrop" id="crate-backdrop">
+      <div class="modal-sheet" onclick="event.stopPropagation()">
+        <div style="padding:22px 26px;display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid rgba(245,245,240,0.12)">
+          <span class="font-display" style="font-size:32px;text-transform:uppercase">CRATE (${state.crate.length} TRACKS)</span>
+          <button id="btn-close-crate" class="exit-btn">✕</button>
+        </div>
+        <div class="nova-scroll" style="padding:12px 26px;overflow-y:auto;flex:1">
+          ${state.crate.length ? state.crate.map((t, idx) => `
+            <div class="review-row" style="justify-content:space-between">
+              <span class="row-idx">${idx + 1}</span>
+              <div class="row-main">
+                <div class="row-title" style="font-size:22px">${esc(t.title)}</div>
+                <div class="row-meta">${esc(t.artist)} · ${fmtTime(t.durationSec)} · ${t.dspReady ? 'FULL DSP' : 'YT DECK'}</div>
+              </div>
+              <button class="remove-row-btn squeeze" data-crate-rm="${idx}" aria-label="Remove ${esc(t.title)}">✕</button>
+            </div>
+          `).join('') : '<p style="color:rgba(245,245,240,0.5);padding:20px 0">Your crate is empty.</p>'}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderSetsModal() {
@@ -937,7 +1021,7 @@ function renderDeckCard(deckId, slotName, deckData) {
 
   const statusBadge = isLive
     ? `<span class="deck-live-badge"><span class="live-dot"></span>LIVE${deckData.playFull ? ' · FULL' : ''}</span>`
-    : `<span style="color:rgba(245,245,240,0.68)">○ ${track ? (deckData.status === 'ready' ? 'READY' : 'CUEING') : 'STANDBY'}</span>`;
+    : `<span id="cue-deck-status" style="color:rgba(245,245,240,0.68)">○ ${track ? (deckData.status === 'ready' ? 'READY' : 'CUEING') : 'STANDBY'}</span>`;
 
   const techBadge = track
     ? `<span class="deck-dsp-pill">${isDsp ? 'DSP' : 'YT'}${track.bpm ? ` · ${Math.round(track.bpm)} BPM` : ''}${track.camelot ? ` · ${esc(track.camelot)}` : ''}</span>`
@@ -1019,6 +1103,9 @@ function renderProDrawer() {
                 ['DROP_SWAP', 'DROP SWAP'],
                 ['TENSION_ROLL_DROP', 'BEAT ROLL'],
                 ['ECHO_OUT_BRAKE', 'ECHO BRAKE'],
+                ['HARMONIC_BLEND', 'HARMONIC BLEND'],
+                ['BREAKDOWN_BRIDGE', 'BREAKDOWN'],
+                ['PERCUSSION_BRIDGE', 'DRUM BRIDGE'],
               ].map(([code, label]) => `
                 <button class="pill-btn squeeze" data-force-style="${code}">${label}</button>
               `).join('')}
@@ -1033,16 +1120,39 @@ function renderProDrawer() {
           </div>
         ` : `
           <div style="display:flex;flex-direction:column;gap:14px">
-            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55)">YOUTUBE DECK SETTINGS</div>
+            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55)">YOUTUBE BLEND &amp; DECK CONSOLE</div>
             <div class="fx-slider-row">
-              <label><span>CROSSFADE DURATION</span><span>${state.ytCrossfadeSec}s</span></label>
-              <input id="yt-xfade-range" type="range" min="2" max="8" step="0.5" value="${state.ytCrossfadeSec}" />
+              <label><span>BLEND OVERLAP DURATION</span><span id="yt-xfade-val">${state.ytCrossfadeSec}s</span></label>
+              <input id="yt-xfade-range" type="range" min="2" max="10" step="0.5" value="${state.ytCrossfadeSec}" />
             </div>
-            <button id="btn-toggle-pip" class="pill-btn squeeze ${state.pipVideoVisible ? 'active' : ''}">
-              ${state.pipVideoVisible ? 'HIDE YOUTUBE VIDEO PIP' : 'SHOW YOUTUBE VIDEO PIP'}
+
+            <div>
+              <div class="font-display" style="font-size:18px;color:rgba(245,245,240,0.55);margin-bottom:8px">BLEND CHOREOGRAPHY</div>
+              <div style="display:flex;flex-wrap:wrap;gap:8px">
+                ${[
+                  ['phrase', 'PHRASE BLEND'],
+                  ['sweep_cut', 'SWEEP CUT'],
+                  ['drum_bridge', 'DRUM BRIDGE'],
+                  ['echo_drop', 'ECHO DROP'],
+                ].map(([code, label]) => `
+                  <button class="pill-btn squeeze ${state.ytTransitionStyle === code ? 'active' : ''}" data-yt-style="${code}">${label}</button>
+                `).join('')}
+              </div>
+            </div>
+
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+              <button id="btn-yt-fx" class="pill-btn squeeze ${state.ytFxEnabled ? 'active' : ''}">TRANSITION FX ${state.ytFxEnabled ? 'ON' : 'OFF'}</button>
+              <button id="btn-toggle-pip" class="pill-btn squeeze ${state.pipVideoVisible ? 'active' : ''}">
+                ${state.pipVideoVisible ? 'HIDE YOUTUBE VIDEO PIP' : 'SHOW YOUTUBE VIDEO PIP'}
+              </button>
+            </div>
+
+            <button class="pill-btn squeeze" style="border-color:var(--accent);color:var(--accent)" id="btn-yt-mix-now-drawer" ${!snap?.cueTrack || snap?.crossfading ? 'disabled' : ''}>
+              ⚡ TRIGGER ${esc(state.ytTransitionStyle.replace(/_/g, ' ').toUpperCase())} NOW
             </button>
-            <p style="font-size:13px;color:rgba(245,245,240,0.55);line-height:1.5">
-              Browser security blocks Web Audio EQ/stems inside cross-origin YouTube iframes. Drop MP3/WAV/FLAC files or search Audius for full 4-stem isolation, Signalsmith key-locked beatmatching, and beat-roll FX!
+
+            <p style="font-size:13px;color:rgba(245,245,240,0.52);line-height:1.5">
+              Dual YouTube Decks overlap cleanly with Web Audio sweep/drum-bridge accents. Drop local audio files or switch to Audius Full DSP for per-stem 4-band isolation &amp; Signalsmith key-locked beatmatching.
             </p>
           </div>
         `}
@@ -1075,7 +1185,10 @@ function renderPlayNextModal() {
             <span class="font-display" style="font-size:32px;text-transform:uppercase">PLAY NEXT</span>
             <button id="btn-close-playnext" class="exit-btn">✕</button>
           </div>
-          <input id="input-playnext" class="ingest-input" style="width:100%;margin-top:14px;height:54px" value="${esc(state.playNextQuery)}" placeholder="Filter crate or press Enter to search YouTube…" autofocus />
+          <div style="display:flex;gap:10px;margin-top:14px">
+            <input id="input-playnext" class="ingest-input" style="flex:1;height:54px" value="${esc(state.playNextQuery)}" placeholder="Filter crate or search YouTube…" autofocus />
+            <button id="btn-playnext-search" class="ingest-btn squeeze" style="height:54px;font-size:20px;padding:0 18px">SEARCH YT</button>
+          </div>
         </div>
         <div id="playnext-list" class="nova-scroll" style="padding:10px 26px 24px;overflow-y:auto;flex:1">
           ${matches.slice(0, 30).map((t) => `
@@ -1321,6 +1434,21 @@ function bindWizardEvents() {
           state.setsModalOpen = false;
           buildReviewSet();
         }
+      };
+    });
+  }
+
+  const openCrate = document.getElementById('btn-open-crate');
+  if (openCrate) openCrate.onclick = () => { state.crateModalOpen = true; render(); };
+
+  if (state.crateModalOpen) {
+    document.getElementById('crate-backdrop').onclick = () => { state.crateModalOpen = false; render(); };
+    document.getElementById('btn-close-crate').onclick = () => { state.crateModalOpen = false; render(); };
+    document.querySelectorAll('[data-crate-rm]').forEach((b) => {
+      b.onclick = () => {
+        state.crate.splice(Number(b.dataset.crateRm), 1);
+        if (!state.crate.length) state.crateModalOpen = false;
+        render();
       };
     });
   }
@@ -1631,6 +1759,30 @@ function bindPlayingEvents() {
     if (ytRange) ytRange.oninput = (e) => {
       state.ytCrossfadeSec = Number(e.target.value);
       orchestrator.ytCrossfadeSec = state.ytCrossfadeSec;
+      const lbl = document.getElementById('yt-xfade-val');
+      if (lbl) lbl.textContent = `${state.ytCrossfadeSec}s`;
+    };
+
+    document.querySelectorAll('[data-yt-style]').forEach((b) => {
+      b.onclick = () => {
+        state.ytTransitionStyle = b.dataset.ytStyle;
+        orchestrator.ytTransitionStyle = state.ytTransitionStyle;
+        render();
+      };
+    });
+
+    const ytFxBtn = document.getElementById('btn-yt-fx');
+    if (ytFxBtn) ytFxBtn.onclick = () => {
+      state.ytFxEnabled = !state.ytFxEnabled;
+      orchestrator.ytFxEnabled = state.ytFxEnabled;
+      render();
+    };
+
+    const ytMixNow = document.getElementById('btn-yt-mix-now-drawer');
+    if (ytMixNow) ytMixNow.onclick = () => {
+      state.drawerOpen = false;
+      orchestrator.mixNow(state.ytTransitionStyle);
+      render();
     };
 
     const pipBtn = document.getElementById('btn-toggle-pip');
@@ -1641,6 +1793,9 @@ function bindPlayingEvents() {
 
     document.getElementById('btn-quick-save-set').onclick = async () => {
       await saveCurrentSetToDb(`NOVA ${state.vibe.toUpperCase()} SET`);
+      if (orchestrator && state.setSavedMsg) {
+        orchestrator.agentMessage = state.setSavedMsg;
+      }
       state.drawerOpen = false;
       render();
     };
@@ -1682,17 +1837,28 @@ function bindPlayingEvents() {
       `).join('') || '<p style="color:rgba(245,245,240,0.5);padding:18px 0">No matching tracks in crate. Press Enter to search YouTube!</p>';
       bindPickNext();
     };
-    pnInp.oninput = (e) => { state.playNextQuery = e.target.value; updatePlayNextList(); };
-    pnInp.onkeydown = async (e) => {
-      if (e.key === 'Enter' && state.playNextQuery.trim()) {
-        const res = await fetch(`/api/youtube-search?q=${encodeURIComponent(state.playNextQuery.trim())}&limit=8`);
+    const runPlayNextYtSearch = async () => {
+      const q = state.playNextQuery.trim();
+      if (!q) return;
+      const btn = document.getElementById('btn-playnext-search');
+      if (btn) btn.textContent = '…';
+      try {
+        const res = await fetch(`/api/youtube-search?q=${encodeURIComponent(q)}&limit=8`);
         const d = await res.json();
         if (d.results?.length) {
           for (const t of d.results) addTrackToCrate(t);
           updatePlayNextList();
         }
+      } finally {
+        if (btn) btn.textContent = 'SEARCH YT';
       }
     };
+    pnInp.oninput = (e) => { state.playNextQuery = e.target.value; updatePlayNextList(); };
+    pnInp.onkeydown = async (e) => {
+      if (e.key === 'Enter') await runPlayNextYtSearch();
+    };
+    const pnSearchBtn = document.getElementById('btn-playnext-search');
+    if (pnSearchBtn) pnSearchBtn.onclick = runPlayNextYtSearch;
     bindPickNext();
   }
 
