@@ -1,3 +1,26 @@
-module.exports = (_req,res) => {
-  res.setHeader('Cache-Control','no-store');
-  res.status(200).json({status:'ok',service:'NOVA AI DJ',version:'nova-intelligence-1',features:['dual-deck-playback','tempo-aware-auto-director','phrase-aligned-crossfade','three-band-eq','master-echo-reverb-filter','four-bar-loop','unified-open-catalogue-search','preview-only-mainstream-discovery','metadata-only-recording-search','local-mix-feedback'],catalogue:...[truncated]
+import { handlePreflight, sendJson } from './_lib/http.js';
+import { getDbHealth } from './_lib/db.js';
+
+export default async function handler(req, res) {
+  if (handlePreflight(req, res)) return;
+  const db = await getDbHealth();
+  return sendJson(res, 200, {
+    ok: true,
+    service: 'NOVA AI DJ v2',
+    version: 'supernova-2.0',
+    youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+    audioWorkerConfigured: Boolean(process.env.AUDIO_WORKER_URL),
+    database: db,
+    capabilities: [
+      'youtube-search',
+      'youtube-playlist-import',
+      'dual-deck-youtube-iframe',
+      'essentia-wasm-beatgrid-key',
+      'signalsmith-pitch-preserving-stretch',
+      'spectral-and-stem-mixing',
+      'eight-club-transitions',
+      'audius-full-streams',
+      'db-cue-learning',
+    ],
+  });
+}

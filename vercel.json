@@ -17,11 +17,8 @@
     }
   ],
   "functions": {
-    "api/catalogue.js": {
+    "api/*.js": {
       "maxDuration": 10
-    },
-    "api/health.js": {
-      "maxDuration": 5
     }
   }
 }

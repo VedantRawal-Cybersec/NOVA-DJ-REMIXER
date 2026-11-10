@@ -1,125 +1,188 @@
-function send(res, status, payload) {
-  res.status(status).setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  return res.end(JSON.stringify(payload));
+import { getQueryParams, handlePreflight, sendJson } from './_lib/http.js';
+import {
+  getCachedPlaylist,
+  getTracksByIds,
+  saveCachedPlaylist,
+  upsertTracks,
+} from './_lib/db.js';
+import {
+  fetchSingleYouTubeTrack,
+  fetchYouTubePlaylistTracks,
+  parseYouTubeInput,
+  searchYouTubeTracks,
+} from './_lib/youtube.js';
+
+function mergeCachedTrackData(tracks, cachedMap) {
+  return tracks.map((t) => {
+    const c = cachedMap[t.id];
+    if (!c) return t;
+    return {
+      ...t,
+      bpm: c.bpm ?? t.bpm,
+      key: c.key ?? t.key,
+      camelot: c.camelot ?? t.camelot,
+      energy: c.energy ?? t.energy,
+      entrySec: Number.isFinite(Number(c.entrySec)) ? c.entrySec : t.entrySec,
+      exitSec: Number.isFinite(Number(c.exitSec)) ? c.exitSec : t.exitSec,
+      playFull: typeof c.playFull === 'boolean' ? c.playFull : t.playFull,
+      heat: Array.isArray(c.heat) ? c.heat : t.heat,
+      cueVotes: c.cueVotes || t.cueVotes || 0,
+      cueConfidence: c.cueConfidence || t.cueConfidence,
+    };
+  });
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
+  if (handlePreflight(req, res)) return;
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET');
-    return send(res, 405, { error: 'Method not allowed' });
+    return sendJson(res, 405, { error: 'Method not allowed' });
   }
 
-  const query = String(req.query.q || '').trim().slice(0, 160);
-  const limit = Math.max(1, Math.min(12, Number.parseInt(req.query.limit || '10', 10) || 10));
-  if (!query) return send(res, 400, { error: 'Enter a song, artist, remix or genre.' });
+  const query = getQueryParams(req);
+  const rawInput = String(query.url || query.q || query.playlistId || query.videoId || '').trim();
+  const limit = Math.max(1, Math.min(25, Number.parseInt(query.limit || '15', 10) || 15));
+  const maxItems = Math.max(10, Math.min(200, Number.parseInt(query.maxItems || '150', 10) || 150));
+  const refresh = query.refresh === '1' || query.refresh === 'true';
+
+  if (!rawInput) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: 'Paste a YouTube playlist URL, video URL, or enter a search query.',
+    });
+  }
+
+  const parsed = parseYouTubeInput(rawInput);
+  if (parsed.kind === 'empty') {
+    return sendJson(res, 400, { ok: false, error: 'Empty YouTube input.' });
+  }
+
+  // Check cached playlist in DB first when importing playlist
+  if (parsed.kind === 'playlist' && !refresh) {
+    const cachedPlaylist = await getCachedPlaylist(parsed.playlistId, 24);
+    if (cachedPlaylist && Array.isArray(cachedPlaylist.results) && cachedPlaylist.results.length) {
+      const cachedMap = await getTracksByIds(cachedPlaylist.results.map((t) => t.id));
+      return sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          kind: 'playlist',
+          ...cachedPlaylist,
+          results: mergeCachedTrackData(cachedPlaylist.results, cachedMap),
+        },
+        's-maxage=120, stale-while-revalidate=300'
+      );
+    }
+  }
 
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey) {
-    const result = {
+    // Even without YOUTUBE_API_KEY, a direct video URL can still play via embed fallback!
+    if (parsed.kind === 'video' && parsed.videoId) {
+      return sendJson(res, 200, {
+        ok: true,
+        kind: 'video',
+        fallbackEmbed: true,
+        count: 1,
+        results: [
+          {
+            id: `yt-${parsed.videoId}`,
+            videoId: parsed.videoId,
+            youtubeIds: [parsed.videoId],
+            source: 'youtube',
+            provider: 'YouTube',
+            playback: 'youtube-iframe',
+            mixReady: true,
+            dspReady: false,
+            title: `YouTube Track (${parsed.videoId})`,
+            artist: 'Direct Link',
+            artwork: `https://i.ytimg.com/vi/${parsed.videoId}/hqdefault.jpg`,
+            durationSec: 210,
+            entrySec: 35,
+            exitSec: 170,
+            playFull: false,
+            energy: 7,
+            url: `https://www.youtube.com/watch?v=${parsed.videoId}`,
+          },
+        ],
+      });
+    }
+    return sendJson(res, 503, {
+      ok: false,
       setupRequired: true,
-      error: 'YouTube search is not configured.',
-      message: 'YOUTUBE_API_KEY is missing from the Vercel Production environment.'
-    };
-    return send(res, 503, result);
+      error: 'YOUTUBE_API_KEY is missing in environment variables.',
+      message: 'Set YOUTUBE_API_KEY on Vercel to enable YouTube search and full playlist importing.',
+    });
   }
 
   try {
-    const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
-    searchUrl.search = new URLSearchParams({
-      part: 'snippet',
-      type: 'video',
-      q: query,
-      maxResults: String(limit),
-      videoEmbeddable: 'true',
-      videoSyndicated: 'true',
-      safeSearch: 'moderate',
-      regionCode: 'IN'
-    }).toString();
-
-    const searchResponse = await fetch(searchUrl, {
-      headers: { 'x-goog-api-key': apiKey }
-    });
-    const searchData = await searchResponse.json();
-    if (!searchResponse.ok) {
-      const reason = searchData?.error?.errors?.[0]?.reason || 'youtube_api_error';
-      const providerMessage = searchData?.error?.message || 'Google rejected the YouTube Data API request.';
-      console.error('NOVA YouTube search rejected:', searchResponse.status, reason, providerMessage);
-      const result = {
-        ok: false,
-        error: reason === 'quotaExceeded'
-          ? 'YouTube search quota has been reached. Review the Google Cloud quota.'
-          : 'YouTube rejected the search request. Check the Google Cloud API key and API restrictions.',
-        code: reason,
-        providerStatus: searchResponse.status,
-        providerMessage
-      };
-      return send(res, 502, result);
-    }
-
-    const items = Array.isArray(searchData.items) ? searchData.items : [];
-    const ids = items.map(item => item?.id?.videoId).filter(Boolean);
-    const videoDetails = {};
-
-    if (ids.length) {
-      const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
-      detailsUrl.search = new URLSearchParams({
-        part: 'contentDetails,status',
-        id: ids.join(',')
-      }).toString();
-
-      const detailsResponse = await fetch(detailsUrl, {
-        headers: { 'x-goog-api-key': apiKey }
-      });
-      if (detailsResponse.ok) {
-        const detailsData = await detailsResponse.json();
-        for (const video of detailsData.items || []) videoDetails[video.id] = video;
-      } else {
-        console.error('NOVA YouTube video detail lookup failed:', detailsResponse.status);
+    if (parsed.kind === 'playlist') {
+      const playlist = await fetchYouTubePlaylistTracks(parsed.playlistId, apiKey, maxItems);
+      if (!playlist.results.length) {
+        return sendJson(res, 404, {
+          ok: false,
+          kind: 'playlist',
+          error: 'No embeddable playable videos found in this playlist (it may be private or empty).',
+        });
       }
+      await upsertTracks(playlist.results);
+      await saveCachedPlaylist(playlist);
+      const cachedMap = await getTracksByIds(playlist.results.map((t) => t.id));
+      return sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          kind: 'playlist',
+          ...playlist,
+          results: mergeCachedTrackData(playlist.results, cachedMap),
+        },
+        's-maxage=120, stale-while-revalidate=300'
+      );
     }
 
-    const results = items.map(item => {
-      const videoId = item?.id?.videoId;
-      const snippet = item?.snippet || {};
-      const details = videoDetails[videoId] || {};
-      if (!videoId || details.status?.embeddable === false) return null;
+    if (parsed.kind === 'video') {
+      const track = await fetchSingleYouTubeTrack(parsed.videoId, apiKey);
+      await upsertTracks([track]);
+      const cachedMap = await getTracksByIds([track.id]);
+      return sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          kind: 'video',
+          count: 1,
+          results: mergeCachedTrackData([track], cachedMap),
+        },
+        's-maxage=120, stale-while-revalidate=300'
+      );
+    }
 
-      const thumbnails = snippet.thumbnails || {};
-      return {
-        videoId,
-        title: snippet.title || 'Untitled video',
-        channelTitle: snippet.channelTitle || 'YouTube creator',
-        publishedAt: snippet.publishedAt || '',
-        thumbnail:
-          thumbnails.high?.url ||
-          thumbnails.medium?.url ||
-          thumbnails.default?.url ||
-          '',
-        duration: details.contentDetails?.duration || '',
-        url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(videoId),
-        source: 'YouTube',
-        playback: 'embedded-player'
-      };
-    }).filter(Boolean);
-
-    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=300');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.status(200).end(JSON.stringify({
-      ok: true,
-      query,
-      provider: 'YouTube Data API v3',
-      count: results.length,
-      results,
-      nextPageToken: searchData.nextPageToken || null
-    }));
-  } catch (error) {
-    console.error('NOVA YouTube search runtime failure:', error?.name || 'Error', error?.message || 'unknown');
-    const result = {
+    const tracks = await searchYouTubeTracks(parsed.query, apiKey, limit);
+    await upsertTracks(tracks);
+    const cachedMap = await getTracksByIds(tracks.map((t) => t.id));
+    return sendJson(
+      res,
+      200,
+      {
+        ok: true,
+        kind: 'search',
+        query: parsed.query,
+        count: tracks.length,
+        results: mergeCachedTrackData(tracks, cachedMap),
+      },
+      's-maxage=120, stale-while-revalidate=300'
+    );
+  } catch (err) {
+    console.error('YouTube API error:', err?.status, err?.code, err?.message);
+    return sendJson(res, err?.status && err.status < 500 ? err.status : 502, {
       ok: false,
-      error: 'YouTube search is temporarily unavailable.',
-      runtimeError: error?.name || 'unknown'
-    };
-    return send(res, 502, result);
+      code: err?.code || 'youtube_api_error',
+      error:
+        err?.code === 'quotaExceeded'
+          ? 'YouTube Data API daily quota reached. Cached tracks or local uploads still work!'
+          : err?.message || 'YouTube request failed.',
+    });
   }
-};
+}

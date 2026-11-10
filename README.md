@@ -1,64 +1,35 @@
-# NOVA AI DJ
+# NOVA AI DJ v2 (Supernova Edition)
 
-NOVA is a browser-based DJ mixing workspace with a track catalogue, local audio uploads, a prompt/voice-driven set brief, and a Web Audio mixing engine.
+NOVA is an autonomous browser & dual-deck AI DJ mixing studio styled around brutalist high-contrast performance clarity (`Anton` + `Inter`, Obsidian `#060608` + Supernova Vermilion `#FF4D00` + Solar Amber `#FFB800`).
 
-## Restore and build
+## Architecture
 
-The complete homepage and standalone engine source are stored in `source/chunks/` as independent Brotli-compressed source parts. The repository build restores them into ordinary, readable files.
+### Dual-Path Hybrid Mixing Engine
+1. **Pro Web Audio DSP Engine (`public/js/engine/pro-mixer-engine.js`)** — runs on local audio uploads (`MP3`, `WAV`, `FLAC`, `M4A`, `OGG`) and full CORS-enabled streams (**Audius**, **Openverse**):
+   - **Essentia.js WASM Web Worker (`analysis-worker.js`)**: `RhythmExtractor2013` + `KeyExtractor` at `44.1 kHz`, sub-beat downbeat phase finder, 64-window section & drop segmentation, LUFS loudness measurement, and 88-bar waveform heat.
+   - **Signalsmith Stretch WASM `AudioWorklet`**: Pitch-preserving tempo stretch (*Master Tempo*) + automatic `±1` semitone Camelot harmonic key-lock (`camelot.js`) + quantized 4-bar looping.
+   - **Studio-Transparent 4-Band Isolator (`stems-isolator.js`)**: Zero-latency real-time stem controls (`Vocals`, `Drums`, `Bass`, `Air`) + sweepable HPF/LPF color filter, tempo-synced ping-pong echo, algorithmic reverb, synthesized percussion bridge, and live `.webm` mix recording.
+   - **8 Club Transition Choreographies**: `BASS_SWAP_16BAR`, `STEM_VOCAL_PASS`, `DROP_SWAP`, `TENSION_ROLL_DROP`, `ECHO_OUT_BRAKE`, `HARMONIC_BLEND`, `BREAKDOWN_BRIDGE`, `PERCUSSION_BRIDGE`.
+2. **Dual-Deck YouTube Engine (`public/js/engine/youtube-deck-engine.js`)** — runs on YouTube search results, single links, and imported playlists:
+   - Imports full YouTube playlists (`youtube/v3/playlistItems` paginated up to 150 tracks) and searches embeddable music videos via `YOUTUBE_API_KEY`.
+   - Dual pre-cued YouTube IFrame decks (`yt-deck-A` / `yt-deck-B`) with equal-power `sin/cos` crossfade, optional PIP video preview, and interactive drag-to-seek cue learning.
 
-```bash
-npm run build
-```
+### Database Persistence (`api/_lib/db.js`)
+Auto-detects connected Vercel database integrations without extra setup:
+- **Postgres** (`POSTGRES_URL`, `DATABASE_URL`, `NEON_DATABASE_URL`, `POSTGRES_PRISMA_URL`) with auto-created tables (`nova_tracks`, `nova_playlists`, `nova_sets`, `nova_cue_feedback`)
+- **Supabase REST** (`SUPABASE_URL` + key)
+- **Vercel KV / Upstash Redis** (`KV_REST_API_URL` + token)
+- Falls back gracefully to browser `localStorage` when running offline.
 
-The build creates:
-
-- `public/index.html` — the complete NOVA website, including the current UI and inline browser application code.
-- `src/nova-audio-engine.js` — the standalone, readable audio-engine source.
-
-The build uses Node.js built-in modules only. No third-party npm dependencies are required. Vercel is configured to run this build and publish `public/`.
-
-## Current application features
-
-- Track catalogue discovery using supported public metadata and preview providers.
-- Local audio-file loading and decoding into browser `AudioBuffer` objects.
-- BPM estimation, onset/beat-grid analysis, downbeat confidence, energy curve and heuristic section estimation.
-- Mix-in and mix-out cue selection, including longer phrase-aware outgoing windows.
-- Playback-rate tempo matching between decks.
-- Web Audio scheduling against the audio context clock.
-- Automated transition planning with bass handover, three-band EQ, filters and echo.
-- Optional generated kick/snare/hat percussion layer.
-- Mix recording through the browser audio graph.
-- Prompt-driven and voice-input DJ set briefs where browser speech recognition is available.
-
-## API routes
-
-- `/api/health` — health/status response.
-- `/api/catalogue` — catalogue search and supported provider aggregation.
-- `/api/proxy` — existing same-origin proxy retained from the original project.
-- `/api/youtube-search` — YouTube Data API search endpoint.
-- `youtube-integration.js` — existing YouTube embed/queue integration source.
-
-### YouTube configuration
-
-Set `YOUTUBE_API_KEY` in the Vercel Production environment after enabling YouTube Data API v3 in Google Cloud. Keep the key in Vercel environment variables; never place it in browser-side source code.
-
-YouTube playback remains through the official embedded player. It is not extracted or passed into the DJ audio transformation engine.
-
-## Technical boundaries
-
-- Beat grids, downbeats, sections, cue points and key indicators are browser-side estimates, not guaranteed ground truth.
-- When downbeat confidence is low, the engine falls back to beat-grid cues.
-- The current implementation does not include vocal/instrumental source separation, true stem extraction, lyric transcription, or a trained music-understanding model.
-- Browser decoding depends on the source being fetchable and CORS-permitted, or on the user uploading a local audio file.
-- Catalogue availability and preview length depend on provider APIs and licensing. This project does not grant rights to download, remix, distribute, or publicly perform third-party recordings.
-
-## Development
-
-Requirements: Node.js 20 or newer.
+## Commands
 
 ```bash
-npm run build
-node --check src/nova-audio-engine.js
+npm install
+npm run build   # Copies Essentia.js & Signalsmith Stretch WASM bundles to public/vendor/
+npm run check   # Runs Node syntax validation across api/, scripts/, and public/js/
+npm run dev     # Starts local static + serverless API dev server on http://127.0.0.1:4173
 ```
 
-The Vercel build command is `npm run build`; the static output directory is `public`. Existing API and YouTube source files are retained in the repository.
+## Vercel Environment Variables
+- `YOUTUBE_API_KEY` — YouTube Data API v3 key for search & playlist import.
+- Database env vars (`POSTGRES_URL` / `DATABASE_URL` / `SUPABASE_URL` / `KV_REST_API_URL`) — auto-detected by `api/_lib/db.js`.
