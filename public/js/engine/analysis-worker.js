@@ -337,14 +337,18 @@ function computeBarStructure(duration, bpm, downbeats, beats, spec) {
   };
 
   const energy_per_bar = normArr(rawRms);
+  const drumsNorm = normArr(rawDrums);
+  const bassNorm = normArr(rawBass);
   const stem_activity = {
-    bass: normArr(rawBass),
-    drums: normArr(rawDrums),
+    bass: bassNorm,
+    drums: drumsNorm,
     vocals: normArr(rawVocals),
     other: normArr(rawOther),
+    drum_density: drumsNorm,
+    bass_presence: bassNorm,
   };
 
-  // Detect sections on bar grid (intro, verse, build, chorus, bridge, outro)
+  // Detect sections on bar grid (intro, verse, pre_chorus, build, chorus, bridge, breakdown, outro)
   const sections = [];
   for (let i = 0; i < barCount; i++) {
     const prev = energy_per_bar[Math.max(0, i - 1)];
@@ -355,8 +359,10 @@ function computeBarStructure(duration, bpm, downbeats, beats, spec) {
     if (i < Math.min(8, Math.floor(barCount * 0.14)) && cur < 0.62) type = 'intro';
     else if (i >= Math.max(barCount - 8, Math.floor(barCount * 0.85)) && cur < 0.68) type = 'outro';
     else if (cur >= 0.76 && stem_activity.drums[i] >= 0.48) type = 'chorus';
+    else if (grad > 0.12 && cur >= 0.48 && next >= 0.72) type = 'pre_chorus';
     else if (grad > 0.08 && cur >= 0.42) type = 'build';
-    else if (cur < 0.48 && stem_activity.drums[i] < 0.35 && i > 4 && i < barCount - 6) type = 'bridge';
+    else if (cur < 0.42 && stem_activity.drums[i] < 0.28 && i > 8 && i < barCount - 8) type = 'breakdown';
+    else if (cur < 0.5 && stem_activity.drums[i] < 0.38 && i > 4 && i < barCount - 6) type = 'bridge';
 
     const last = sections[sections.length - 1];
     if (last && last.type === type) {
@@ -428,16 +434,28 @@ function computeBarStructure(duration, bpm, downbeats, beats, spec) {
 function detectTempoStabilityAndWarnings(beats, bpm, bpmConf, downConf, barStruct, spec) {
   const warnings = [];
   let drift_pct = 0;
+  const tempo_changes = [];
   if (beats.length >= 12) {
     const ibis = [];
     for (let i = 1; i < beats.length; i++) {
       const d = beats[i] - beats[i - 1];
-      if (d > 0.25 && d < 1.2) ibis.push(d);
+      if (d > 0.25 && d < 1.2) ibis.push({ d, t: beats[i] });
     }
     if (ibis.length >= 8) {
-      const q1 = ibis.slice(0, Math.floor(ibis.length * 0.3)).reduce((a, b) => a + b, 0) / Math.floor(ibis.length * 0.3);
-      const q3 = ibis.slice(Math.floor(ibis.length * 0.7)).reduce((a, b) => a + b, 0) / (ibis.length - Math.floor(ibis.length * 0.7));
+      const q1 = ibis.slice(0, Math.floor(ibis.length * 0.3)).reduce((a, b) => a + b.d, 0) / Math.floor(ibis.length * 0.3);
+      const q3 = ibis.slice(Math.floor(ibis.length * 0.7)).reduce((a, b) => a + b.d, 0) / (ibis.length - Math.floor(ibis.length * 0.7));
       drift_pct = Math.round((Math.abs(q3 - q1) / Math.max(0.2, q1)) * 1000) / 10;
+
+      // Scan 16-beat windows for deliberate tempo-change boundaries
+      let prevWinBpm = null;
+      for (let idx = 0; idx + 12 < ibis.length; idx += 12) {
+        const avgD = ibis.slice(idx, idx + 12).reduce((a, x) => a + x.d, 0) / 12;
+        const winBpm = Math.round((60 / avgD) * 10) / 10;
+        if (prevWinBpm !== null && (Math.abs(winBpm - prevWinBpm) / Math.max(55, prevWinBpm)) * 100 >= 4.5) {
+          tempo_changes.push({ at_sec: Math.round(ibis[idx].t * 100) / 100, from_bpm: prevWinBpm, to_bpm: winBpm });
+        }
+        prevWinBpm = winBpm;
+      }
     }
   }
 
@@ -448,7 +466,7 @@ function detectTempoStabilityAndWarnings(beats, bpm, bpmConf, downConf, barStruc
     } else break;
   }
 
-  const is_variable = drift_pct > 3.5;
+  const is_variable = drift_pct > 3.5 || tempo_changes.length > 0;
   if (bpmConf < 0.32 || beats.length < 8) warnings.push('no_clear_beat');
   if (is_variable) warnings.push('variable_tempo');
   if (free_time_intro_sec >= 6) warnings.push('free_time_intro');
@@ -471,7 +489,7 @@ function detectTempoStabilityAndWarnings(beats, bpm, bpmConf, downConf, barStruc
     drum_feel: bpm >= 120 && drumAvg > 0.4 ? 'four-on-the-floor' : bpm <= 92 ? 'halftime / bounce' : 'syncopated groove',
   };
 
-  return { tempo_stability: { drift_pct, is_variable, free_time_intro_sec }, warnings, tags };
+  return { tempo_stability: { drift_pct, is_variable, free_time_intro_sec, tempo_changes }, warnings, tags };
 }
 
 function pickCuePoints(duration, bpm, beats, downbeats, sections, energyCurve) {

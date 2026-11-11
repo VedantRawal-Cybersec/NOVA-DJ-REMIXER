@@ -863,8 +863,21 @@ export class ProMixerEngine {
           const stAt = at + (s / steps) * 0.85;
           outDeck.stretch.schedule({ output: stAt, outputTime: stAt, rate: 1 - (s / steps) * 0.72, semitones: -s * 2 });
         }
-      } else if (fxItem.type === 'riser_impact' || fxItem.type === 'impact') {
-        this.playTransitionSweepFx({ type: 'sweep_cut', bpm: outBpm, durationSec: Math.min(6, dur * 0.85) });
+      } else if (fxItem.type === 'riser_impact' || fxItem.type === 'impact' || fxItem.type === 'reverse_riser') {
+        this.playTransitionSweepFx({ type: fxItem.type === 'reverse_riser' ? 'echo_drop' : 'sweep_cut', bpm: outBpm, durationSec: Math.min(6, dur * 0.85) });
+      } else if (fxItem.type === 'stutter') {
+        const div = Number(fxItem.params?.division_beats) || 0.25;
+        const repeats = Math.min(16, Number(fxItem.params?.repeats) || 8);
+        const stepSec = beatSec * div;
+        for (let s = 0; s < repeats; s++) {
+          const stAt = at + s * stepSec;
+          outGain.setValueAtTime(1.0, stAt);
+          outGain.setValueAtTime(0.05, stAt + stepSec * 0.52);
+        }
+      } else if (fxItem.type === 'key_lift' && inDeck.stretch) {
+        const liftSemi = Math.max(-2, Math.min(2, Number(fxItem.params?.semitones) || 1));
+        const liftAt = startAt + dur * 0.5;
+        inDeck.stretch.schedule({ output: liftAt, outputTime: liftAt, semitones: liftSemi });
       }
     }
 
@@ -878,6 +891,45 @@ export class ProMixerEngine {
     }
 
     return { startAt, endAt };
+  }
+
+  /**
+   * Per-bar drift monitor comparing AudioContext playback clock against measured downbeat grid.
+   * Applies subtle +-0.4% pitch-locked rate micro-nudges if drift exceeds 15 ms.
+   */
+  checkDriftAndCorrect(deckId) {
+    const deck = this.decks[deckId];
+    if (!deck || !deck.playing || !deck.analysis?.beat_times?.length || !this.ctx || !deck.stretch) return 0;
+    const now = this.ctx.currentTime;
+    if (deck.lastDriftCheckAt && now - deck.lastDriftCheckAt < 1.8) return 0;
+    deck.lastDriftCheckAt = now;
+
+    const pos = this.getDeckPosition(deckId);
+    const beats = deck.analysis.beat_times;
+    let nearest = beats[0];
+    let minDiff = Infinity;
+    for (let i = 0; i < beats.length; i++) {
+      const d = Math.abs(beats[i] - pos);
+      if (d < minDiff) {
+        minDiff = d;
+        nearest = beats[i];
+      }
+    }
+    const driftMs = (pos - nearest) * 1000;
+    if (Math.abs(driftMs) > 15 && Math.abs(driftMs) < 95) {
+      const nudge = driftMs > 0 ? 0.996 : 1.004;
+      deck.stretch.schedule({
+        output: now + 0.04,
+        outputTime: now + 0.04,
+        rate: (deck.rate || 1) * nudge,
+      }).catch(() => {});
+      deck.stretch.schedule({
+        output: now + 0.44,
+        outputTime: now + 0.44,
+        rate: deck.rate || 1,
+      }).catch(() => {});
+    }
+    return Math.round(driftMs);
   }
 
   async triggerSpinback(deckId) {

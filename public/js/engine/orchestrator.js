@@ -207,9 +207,20 @@ export class NovaOrchestrator {
     if (second) {
       await this.#preloadDeck('B', second);
     }
+    this.#prewarmUpcoming();
 
     this.#startTick();
     this.#emit();
+  }
+
+  #prewarmUpcoming() {
+    // Phase 6: pre-decode next 2 upcoming DSP tracks in background while live set plays
+    const upcoming = this.queue.slice(this.nextIndex, this.nextIndex + 2);
+    for (const t of upcoming) {
+      if (this.#isDspTrack(t) && !this.proMixer.decodedCache.has(t.id)) {
+        this.proMixer.decodeAndAnalyze(t).catch(() => {});
+      }
+    }
   }
 
   #popNext() {
@@ -339,6 +350,7 @@ export class NovaOrchestrator {
       liveSlot.position = this.proMixer.getDeckPosition(liveId);
       liveSlot.duration = liveSlot.track?.durationSec || liveSlot.duration;
       this.proMixer.scheduleClickLookahead(liveId);
+      if (!this.crossfading) this.proMixer.checkDriftAndCorrect(liveId);
     } else if (liveSlot.engine === 'yt') {
       const p = this.ytEngine.getPosition(liveId);
       if (p) {
@@ -495,6 +507,7 @@ export class NovaOrchestrator {
     if (upcoming) {
       this.#setAgent(`LIVE · ${inSlot.track.title.toUpperCase()} · NEXT: ${upcoming.title.toUpperCase()}`);
       this.#preloadDeck(outId, upcoming);
+      this.#prewarmUpcoming();
     } else {
       this.#setAgent(`FINAL TRACK · ${inSlot.track.title.toUpperCase()}`);
     }

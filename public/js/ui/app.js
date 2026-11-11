@@ -7,7 +7,11 @@ import {
   scorePairCandidates,
   validateTransitionRecipe,
 } from '/js/engine/dj-brain.js';
-import { exportMixToWav } from '/js/engine/offline-exporter.js';
+import {
+  exportMixToWav,
+  extractAudioSliceWavBase64,
+  renderTransitionClipBase64,
+} from '/js/engine/offline-exporter.js';
 import { renderBrainModal, renderDebugModal } from '/js/ui/debug-studio.js';
 
 const root = document.getElementById('app');
@@ -95,18 +99,24 @@ const state = {
   // Director Choices & AI Brain Plan
   playMode: 'club',
   vibe: 'peak',
+  moodEnergy: 75,
   crowd: 'medium',
   sequencedSet: [],
   setPlan: null,
   opusBusy: false,
   opusKey: (() => { try { return sessionStorage.getItem('nova.opus.key') || ''; } catch { return ''; } })(),
+  geminiKey: (() => { try { return sessionStorage.getItem('nova.gemini.key') || ''; } catch { return ''; } })(),
+  openaiKey: (() => { try { return sessionStorage.getItem('nova.openai.key') || ''; } catch { return ''; } })(),
   debugModalOpen: false,
   brainModalOpen: false,
   exportBusy: false,
   exportMsg: '',
   previewBusyIdx: -1,
+  auditBusyIdx: -1,
+  costEstimate: null,
   clickTrack: false,
   ratingsMap: (() => { try { return JSON.parse(localStorage.getItem('nova.transition.ratings.v1') || '{}'); } catch { return {}; } })(),
+  learningHistory: (() => { try { return JSON.parse(localStorage.getItem('nova.learning.history.v1') || '[]'); } catch { return []; } })(),
 
   // Saved sets
   savedSets: [],
@@ -250,6 +260,55 @@ function triggerCueHint() {
   }, 7500);
 }
 
+function getAiHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    ...(state.opusKey ? { 'x-anthropic-key': state.opusKey } : {}),
+    ...(state.geminiKey ? { 'x-gemini-key': state.geminiKey } : {}),
+    ...(state.openaiKey ? { 'x-openai-key': state.openaiKey } : {}),
+  };
+}
+
+function getAnalysisCache() {
+  try {
+    return JSON.parse(localStorage.getItem('nova.analysis.cache.v2') || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function saveAnalysisCache(id, patch) {
+  if (!id) return;
+  try {
+    const cache = getAnalysisCache();
+    cache[id] = { ...(cache[id] || {}), ...patch, updatedAt: Date.now() };
+    const entries = Object.entries(cache).sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0)).slice(0, 40);
+    localStorage.setItem('nova.analysis.cache.v2', JSON.stringify(Object.fromEntries(entries)));
+  } catch {}
+}
+
+function refreshCostEstimate() {
+  if (!state.crate.length) {
+    state.costEstimate = null;
+    return;
+  }
+  const dspCount = state.crate.filter((t) => t.file || t.dspReady).length;
+  const ytCount = state.crate.length - dspCount;
+  fetch('/api/ai', {
+    method: 'POST',
+    headers: getAiHeaders(),
+    body: JSON.stringify({ action: 'estimate_cost', dspCount, ytCount }),
+  })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => {
+      if (d?.ok && d.estimate) {
+        state.costEstimate = d.estimate;
+        if (state.screen === 'wizard' && state.wizardStep === 0 && document.activeElement?.id !== 'input-source') render();
+      }
+    })
+    .catch(() => {});
+}
+
 async function fetchHealth() {
   try {
     const res = await fetch('/api/health');
@@ -303,9 +362,12 @@ function addTrackToCrate(track) {
   if (!track || !track.id) return false;
   if (state.crate.some((t) => t.id === track.id)) return false;
   const learned = getLearnedCueMap()[track.id];
-  const merged = learned
-    ? { ...track, entrySec: learned.entrySec ?? track.entrySec, playFull: learned.playFull ?? track.playFull, cueConfidence: 'user' }
-    : track;
+  const cachedAi = getAnalysisCache()[track.id];
+  const merged = {
+    ...track,
+    ...(cachedAi || {}),
+    ...(learned ? { entrySec: learned.entrySec ?? track.entrySec, playFull: learned.playFull ?? track.playFull, cueConfidence: 'user' } : {}),
+  };
   state.crate.push({ ...merged, heat: buildFallbackHeat(merged) });
   return true;
 }
@@ -366,6 +428,7 @@ async function handleSourceFetch(overrideQuery = null) {
         let added = 0;
         for (const t of tracks) if (addTrackToCrate(t)) added++;
         state.searchStatus = `Imported "${data.title || 'Playlist'}": ${added} new songs loaded into your crate (${tracks.length} total).`;
+        refreshCostEstimate();
       } else {
         state.searchStatus = tracks.length
           ? `Found ${tracks.length} YouTube tracks. Tap any card to add to crate, or click ADD ALL.`
@@ -449,6 +512,44 @@ async function handleLocalFiles(files) {
         entrySec: a.clubEntry,
         exitSec: a.clubExit,
       });
+
+      // Async Phase 1 Lyric Transcription & Understanding (cached per song ID; never blocks track loading)
+      const cached = getAnalysisCache()[track.id];
+      const aiConfigured = state.health?.ai?.multiProviderConfigured || state.geminiKey || state.openaiKey || state.opusKey;
+      if (cached?.lyric_understanding) {
+        Object.assign(track, { lyrics: cached.lyrics || [], language: cached.language, lyric_understanding: cached.lyric_understanding });
+      } else if (aiConfigured && rec.buffer) {
+        const wavBase64 = extractAudioSliceWavBase64(rec.buffer, Math.max(0, a.hookEntry || a.clubEntry || 0), 34);
+        if (wavBase64) {
+          fetch('/api/ai', {
+            method: 'POST',
+            headers: getAiHeaders(),
+            body: JSON.stringify({
+              action: 'transcribe_and_understand',
+              songId: track.id,
+              title: track.title,
+              artist: track.artist,
+              durationSec: a.durationSec,
+              bpm: a.bpm,
+              wavBase64,
+            }),
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => {
+              if (!d?.ok) return;
+              const patch = {
+                language: d.language,
+                lyrics: d.lyrics || [],
+                lyric_understanding: d.lyric_understanding || null,
+              };
+              Object.assign(track, patch);
+              if (track.analysis) Object.assign(track.analysis, patch);
+              saveAnalysisCache(track.id, patch);
+              if (state.debugModalOpen || state.screen === 'review') render();
+            })
+            .catch(() => {});
+        }
+      }
     } catch (err) {
       console.warn('Pre-decode skipped:', err?.message);
     }
@@ -457,6 +558,7 @@ async function handleLocalFiles(files) {
 
   state.searchBusy = false;
   state.searchStatus = `Loaded ${count} local track(s) with BPM, Camelot Key & beatgrid into your crate.`;
+  refreshCostEstimate();
   render();
 }
 
@@ -501,7 +603,25 @@ async function advanceFromStep0() {
 }
 
 function getFewShotFeedback() {
+  if (state.learningHistory?.length) {
+    return state.learningHistory.slice(0, 8);
+  }
   return Object.entries(state.ratingsMap || {}).slice(-6).map(([pair, rating]) => ({ pair, rating }));
+}
+
+function getLearningStats() {
+  const hist = state.learningHistory || [];
+  if (!hist.length) return { total: 0, winners: [], avoid: [] };
+  const counts = {};
+  for (const h of hist) {
+    const k = h.type || h.pair || 'blend';
+    if (!counts[k]) counts[k] = { good: 0, bad: 0 };
+    if (h.rating === 'good') counts[k].good++;
+    else counts[k].bad++;
+  }
+  const winners = Object.entries(counts).filter(([, c]) => c.good > c.bad).map(([k, c]) => `${k.replace(/_/g, ' ')} (+${c.good})`);
+  const avoid = Object.entries(counts).filter(([, c]) => c.bad >= c.good).map(([k, c]) => `${k.replace(/_/g, ' ')} (-${c.bad})`);
+  return { total: hist.length, winners, avoid };
 }
 
 function buildReviewSet() {
@@ -510,22 +630,23 @@ function buildReviewSet() {
     playMode: state.playMode,
   });
   state.sequencedSet = ordered;
-  state.setPlan = planSetHeuristic(ordered, { vibe: state.vibe, playMode: state.playMode });
+  state.setPlan = planSetHeuristic(ordered, {
+    vibe: state.vibe,
+    playMode: state.playMode,
+    moodEnergy: state.moodEnergy,
+  });
   state.screen = 'review';
   render();
 
-  // If Claude Opus API key is configured on server or in sessionStorage, upgrade recipes with AI Brain + Validator
-  if (ordered.length >= 2 && (state.health?.opusConfigured || state.opusKey)) {
+  const hasAnyAi = state.health?.ai?.multiProviderConfigured || state.health?.opusConfigured || state.opusKey || state.geminiKey || state.openaiKey;
+  if (ordered.length >= 2 && hasAnyAi) {
     state.opusBusy = true;
     fetch('/api/plan', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(state.opusKey ? { 'x-anthropic-key': state.opusKey } : {}),
-      },
+      headers: getAiHeaders(),
       body: JSON.stringify({
         songs: state.setPlan.analyses,
-        brief: { vibe: state.vibe, playMode: state.playMode, crowd: state.crowd },
+        brief: { vibe: state.vibe, playMode: state.playMode, crowd: state.crowd, moodEnergy: state.moodEnergy },
         fewShotExamples: getFewShotFeedback(),
       }),
     })
@@ -864,6 +985,11 @@ function renderWizard() {
           </div>
 
           <div id="wizard-status-banner" class="status-banner ${state.searchError ? 'err' : ''}">${esc(state.searchStatus)}</div>
+          ${state.costEstimate ? `
+            <div class="font-mono-num" style="font-size:11px;color:rgba(255,184,0,0.78);margin-top:4px">
+              ESTIMATE: ~${state.costEstimate.estimatedSeconds}s · AI Cost ~$${state.costEstimate.estimatedUsd.toFixed(3)} · Active Planner: ${esc(String(state.costEstimate.providers?.PLANNER || 'auto').toUpperCase())}
+            </div>
+          ` : ''}
 
           ${state.searchResults.length ? `
             <div class="search-results-grid">
@@ -965,7 +1091,13 @@ function renderWizard() {
     ${floatingNext}
     ${state.setsModalOpen ? renderSetsModal() : ''}
     ${state.crateModalOpen ? renderCrateModal() : ''}
-    ${state.brainModalOpen ? renderBrainModal({ claudeKeySet: Boolean(state.opusKey), health: state.health }) : ''}
+    ${state.brainModalOpen ? renderBrainModal({
+      claudeKeySet: Boolean(state.opusKey),
+      geminiKeySet: Boolean(state.geminiKey),
+      openaiKeySet: Boolean(state.openaiKey),
+      health: state.health,
+      learningStats: getLearningStats(),
+    }) : ''}
   `;
 
   bindWizardEvents();
@@ -1106,6 +1238,7 @@ function renderReview() {
       exportBusy: state.exportBusy,
       exportMsg: state.exportMsg,
       previewBusyIdx: state.previewBusyIdx,
+      auditBusyIdx: state.auditBusyIdx,
       ratingsMap: state.ratingsMap,
     }) : ''}
   `;
@@ -1394,6 +1527,11 @@ function renderVibeModal() {
               <button class="pill-btn squeeze ${state.vibe === v.id ? 'active' : ''}" data-retune-vibe="${v.id}">${esc(v.label)}</button>
             `).join('')}
           </div>
+
+          <div class="fx-slider-row" style="margin-top:18px">
+            <label><span>LIVE ENERGY ARC SLIDER (CHILL ↔ BANGERS)</span><span id="vibe-energy-val">${state.moodEnergy}%</span></label>
+            <input id="vibe-energy-slider" type="range" min="15" max="100" value="${state.moodEnergy}" />
+          </div>
         </div>
         <div style="padding:16px 26px;border-top:2px solid rgba(245,245,240,0.1)">
           <button id="btn-apply-vibe" class="ingest-btn squeeze" style="width:100%">APPLY &amp; RE-SEQUENCE →</button>
@@ -1499,6 +1637,7 @@ function renderPlaying() {
       exportBusy: state.exportBusy,
       exportMsg: state.exportMsg,
       previewBusyIdx: state.previewBusyIdx,
+      auditBusyIdx: state.auditBusyIdx,
       ratingsMap: state.ratingsMap,
     }) : ''}
   `;
@@ -1643,10 +1782,16 @@ function bindWizardEvents() {
     document.getElementById('btn-close-brain').onclick = () => { state.brainModalOpen = false; render(); };
     document.getElementById('btn-save-opus-key').onclick = () => {
       const val = document.getElementById('input-opus-key')?.value?.trim() || '';
+      const gVal = document.getElementById('input-gemini-key')?.value?.trim() || '';
+      const oVal = document.getElementById('input-openai-key')?.value?.trim() || '';
       state.opusKey = val;
+      if (gVal) state.geminiKey = gVal;
+      if (oVal) state.openaiKey = oVal;
       try {
         if (val) sessionStorage.setItem('nova.opus.key', val);
         else sessionStorage.removeItem('nova.opus.key');
+        if (gVal) sessionStorage.setItem('nova.gemini.key', gVal);
+        if (oVal) sessionStorage.setItem('nova.openai.key', oVal);
       } catch {}
       state.brainModalOpen = false;
       render();
@@ -1731,6 +1876,7 @@ function bindWizardEvents() {
         let added = 0;
         for (const t of state.searchResults) if (addTrackToCrate(t)) added++;
         state.searchStatus = `Added ${added} tracks to crate (${state.crate.length} total).`;
+        refreshCostEstimate();
         render();
       };
     }
@@ -1788,25 +1934,118 @@ function bindWizardEvents() {
   }
 }
 
-function saveTransitionRating(rKey, val) {
+function saveTransitionRating(rKey, val, extra = null) {
   if (!rKey) return;
   state.ratingsMap[rKey] = val;
   try {
     localStorage.setItem('nova.transition.ratings.v1', JSON.stringify(state.ratingsMap));
   } catch {}
   const [fromSongId, toSongId] = rKey.split('->');
+  const matched = extra || state.setPlan?.transitions?.find((r) => r.from === fromSongId && r.to === toSongId);
+  const entry = {
+    pair: rKey,
+    rating: val,
+    type: matched?.type || 'blend',
+    bpmDeltaPct: matched?.compatibility?.bpm_diff_pct ?? null,
+    at: Date.now(),
+  };
+  state.learningHistory = [entry, ...(state.learningHistory || []).filter((h) => h.pair !== rKey)].slice(0, 30);
+  try {
+    localStorage.setItem('nova.learning.history.v1', JSON.stringify(state.learningHistory));
+  } catch {}
+
   fetch('/api/plan', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: getAiHeaders(),
     body: JSON.stringify({
       action: 'rate_transition',
       sessionId: state.sessionId,
       fromSongId,
       toSongId,
+      type: entry.type,
       rating: val,
     }),
   }).catch(() => {});
   render();
+}
+
+async function auditTransitionWithListener(idx) {
+  const rec = state.setPlan?.transitions?.[idx];
+  if (!rec) return;
+  const trackA = state.sequencedSet.find((t) => t.id === rec.from);
+  const trackB = state.sequencedSet.find((t) => t.id === rec.to);
+  if (!trackA || !trackB) return;
+
+  const a = state.setPlan.analyses.find((x) => x.song_id === rec.from);
+  const bSong = state.setPlan.analyses.find((x) => x.song_id === rec.to);
+  const orch = initOrchestrator();
+  state.auditBusyIdx = idx;
+  state.exportMsg = 'Rendering isolated transition clip for AI Audio Listener…';
+  render();
+
+  const log = [];
+  let activeRec = { ...rec };
+  try {
+    for (let iter = 1; iter <= 3; iter++) {
+      state.exportMsg = `Audio Listener + Critic Iteration ${iter}/3…`;
+      render();
+      const { wavBase64, metrics } = await renderTransitionClipBase64(trackA, trackB, activeRec, orch.proMixer);
+      const res = await fetch('/api/ai', {
+        method: 'POST',
+        headers: getAiHeaders(),
+        body: JSON.stringify({
+          action: 'critique_transition',
+          iteration: iter,
+          wavBase64,
+          recipe: activeRec,
+          metrics,
+          songA: a || trackA,
+          songB: bSong || trackB,
+        }),
+      });
+      const data = await res.json();
+      const score = Number(data?.listener?.score_1_to_10) || 7;
+      log.push({
+        iteration: iter,
+        passed: Boolean(data?.passed),
+        score,
+        metrics,
+        notes: data?.listener?.notes || (data?.listener?.issues || []).join('; '),
+        criticProvider: data?.criticProvider || null,
+      });
+
+      if (data?.passed) {
+        activeRec.critiqueLog = log.slice();
+        activeRec.why = `${activeRec.why} [Listener Verified ${score}/10 ✓]`;
+        state.setPlan.transitions[idx] = activeRec;
+        break;
+      }
+      if (data?.revisedRecipe) {
+        activeRec = {
+          ...data.revisedRecipe,
+          compatibility: activeRec.compatibility,
+          candidates: activeRec.candidates,
+          creative_candidates: activeRec.creative_candidates,
+          critiqueLog: log.slice(),
+        };
+      } else {
+        activeRec.critiqueLog = log.slice();
+        state.setPlan.transitions[idx] = activeRec;
+        break;
+      }
+      state.setPlan.transitions[idx] = activeRec;
+      render();
+    }
+    state.setPlan.transitions[idx] = activeRec;
+    if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
+    const last = log[log.length - 1];
+    state.exportMsg = `Listener Audit finished: ${last?.passed ? 'PASSED' : 'REVISED'} (${last?.score ?? '?'}/10) after ${log.length} pass(es).`;
+  } catch (err) {
+    state.exportMsg = err?.message || 'Audio Listener check unavailable.';
+  } finally {
+    state.auditBusyIdx = -1;
+    render();
+  }
 }
 
 function bindDebugModalEvents() {
@@ -1836,6 +2075,32 @@ function bindDebugModalEvents() {
         state.previewBusyIdx = -1;
         render();
       }
+    };
+  });
+
+  document.querySelectorAll('[data-audit-rec]').forEach((b) => {
+    b.onclick = () => auditTransitionWithListener(Number(b.dataset.auditRec));
+  });
+
+  document.querySelectorAll('[data-pick-idea]').forEach((b) => {
+    b.onclick = () => {
+      const idx = Number(b.dataset.pickIdea);
+      const ideaType = b.dataset.ideaType;
+      const cur = state.setPlan?.transitions?.[idx];
+      if (!cur || !ideaType) return;
+      const a = state.setPlan.analyses.find((x) => x.song_id === cur.from);
+      const bSong = state.setPlan.analyses.find((x) => x.song_id === cur.to);
+      if (!a || !bSong) return;
+      const cands = cur.candidates || scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode, moodEnergy: state.moodEnergy }).candidates;
+      let chosen = buildRecipeFromCandidate(a, bSong, cands[0], ideaType);
+      const v = validateTransitionRecipe(chosen, a, bSong);
+      if (!v.valid) chosen = repairOrFallbackRecipe(a, bSong, state.vibe, state.playMode);
+      chosen.validation = validateTransitionRecipe(chosen, a, bSong);
+      chosen.candidates = cands;
+      chosen.critiqueLog = cur.critiqueLog;
+      state.setPlan.transitions[idx] = chosen;
+      if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
+      render();
     };
   });
 
@@ -1980,7 +2245,12 @@ function bindPlayingEvents() {
   if (megaResume) megaResume.onclick = () => orchestrator.togglePause();
 
   const skipBtn = document.getElementById('btn-mega-skip');
-  if (skipBtn) skipBtn.onclick = () => orchestrator.skip();
+  if (skipBtn) skipBtn.onclick = () => {
+    const liveT = state.snap?.liveTrack;
+    const cueT = state.snap?.cueTrack;
+    if (liveT && cueT) saveTransitionRating(`${liveT.id}->${cueT.id}`, 'bad');
+    orchestrator.skip();
+  };
 
   const fullBtn = document.getElementById('btn-mega-full');
   if (fullBtn) fullBtn.onclick = () => {
@@ -2246,14 +2516,24 @@ function bindPlayingEvents() {
     document.querySelectorAll('[data-retune-vibe]').forEach((b) => {
       b.onclick = () => { state.vibe = b.dataset.retuneVibe; render(); };
     });
+    const energySlider = document.getElementById('vibe-energy-slider');
+    if (energySlider) {
+      energySlider.oninput = (e) => {
+        state.moodEnergy = Number(e.target.value);
+        const lbl = document.getElementById('vibe-energy-val');
+        if (lbl) lbl.textContent = `${state.moodEnergy}%`;
+      };
+    }
     document.getElementById('btn-apply-vibe').onclick = () => {
       state.vibeModalOpen = false;
       const liveId = state.snap?.liveTrack?.id;
       const playedIds = new Set((orchestrator?.playedHistory || []).map((t) => t.id));
       const remaining = state.crate.filter((t) => t.id !== liveId && !playedIds.has(t.id));
       const reordered = sequenceCrate(remaining, { vibe: state.vibe, playMode: state.playMode });
+      const newPlan = planSetHeuristic(reordered, { vibe: state.vibe, playMode: state.playMode, moodEnergy: state.moodEnergy });
       orchestrator.vibe = state.vibe;
       orchestrator.playMode = state.playMode;
+      if (newPlan?.transitions?.length) orchestrator.recipes = newPlan.transitions;
       orchestrator.requeueRemaining(reordered);
       render();
     };

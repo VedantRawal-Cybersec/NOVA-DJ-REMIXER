@@ -25,3 +25,6 @@ for (const dir of dirs) {
   };
   walk(full);
 }
+
+const unit = spawnSync(process.execPath, [path.join(root, 'scripts/test-v2-engine.mjs')], { stdio: 'inherit' });
+if (unit.status !== 0) process.exit(unit.status ?? 1);

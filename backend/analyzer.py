@@ -206,8 +206,29 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
     y, sr = librosa.load(str(raw_path), sr=44100, mono=True)
     duration = float(len(y) / sr)
 
-    bpm, bpm_conf, beats, downbeats, stab = _track_beats_and_downbeats(y, sr, duration)
-    key_label, camelot, key_conf = _detect_key_camelot(y, sr)
+    # Measure integrated loudness (approx LUFS) and produce a normalized working copy for balanced stem/energy stats
+    rms_total = float(np.sqrt(np.mean(y ** 2) + 1e-9))
+    measured_lufs = round(max(-40.0, min(-4.0, 20.0 * np.log10(max(1e-5, rms_total)) - 0.691)), 2)
+    gain_lin = float(10 ** (max(-6.0, min(6.0, -14.0 - measured_lufs)) / 20.0))
+    y_norm = np.clip(y * gain_lin, -0.99, 0.99)
+    norm_path = song_dir / "normalized.wav"
+    sf.write(str(norm_path), y_norm.astype(np.float32), sr)
+
+    bpm, bpm_conf, beats, downbeats, stab = _track_beats_and_downbeats(y_norm, sr, duration)
+    key_label, camelot, key_conf = _detect_key_camelot(y_norm, sr)
+
+    tempo_changes: List[Dict[str, Any]] = []
+    if len(beats) >= 16:
+        ibis = np.diff(beats)
+        prev_wbpm = None
+        for idx in range(0, len(ibis) - 11, 12):
+            avg_d = float(np.mean(ibis[idx : idx + 12]))
+            if avg_d > 0.2:
+                wbpm = round(60.0 / avg_d, 1)
+                if prev_wbpm and abs(wbpm - prev_wbpm) / max(55.0, prev_wbpm) >= 0.045:
+                    tempo_changes.append({"at_sec": round(float(beats[idx]), 2), "from_bpm": prev_wbpm, "to_bpm": wbpm})
+                prev_wbpm = wbpm
+    stab["tempo_changes"] = tempo_changes
 
     bar_dur = (60.0 / max(55.0, bpm)) * 4.0
     bar_starts = downbeats if len(downbeats) >= 2 else [round(t, 3) for t in np.arange(0, duration, bar_dur)]
@@ -218,13 +239,12 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
             bars.append({"bar": len(bars), "start_sec": round(float(s), 3), "end_sec": round(float(e), 3)})
     bar_count = len(bars)
 
-    # Stem separation via Demucs or spectral band activity fallback
     stems_map = _separate_stems_demucs(raw_path, song_dir)
     lyrics, language = ([], "unknown")
     if stems_map and "vocals" in stems_map:
         lyrics, language = _transcribe_lyrics(stems_map["vocals"])
 
-    stem_activity = {"vocals": [], "drums": [], "bass": [], "other": []}
+    stem_activity: Dict[str, List[float]] = {"vocals": [], "drums": [], "bass": [], "other": []}
     energy_per_bar: List[float] = []
 
     if stems_map:
@@ -263,6 +283,8 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
     if not stems_map:
         for k in stem_activity:
             stem_activity[k] = _norm(stem_activity[k])
+    stem_activity["drum_density"] = stem_activity["drums"]
+    stem_activity["bass_presence"] = stem_activity["bass"]
 
     # Sections & phrase boundaries
     phrase_boundaries = [{"bar": b["bar"], "sec": b["start_sec"], "multiple": 32 if b["bar"] % 32 == 0 else (16 if b["bar"] % 16 == 0 else 8)} for b in bars if b["bar"] % 8 == 0]
@@ -304,6 +326,7 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
         "hash": h,
         "title": Path(filename).stem,
         "duration_sec": round(duration, 2),
+        "lufs": measured_lufs,
         "bpm": bpm,
         "bpm_confidence": bpm_conf,
         "beat_times": beats,

@@ -15,6 +15,11 @@ export const TRANSITION_TYPES = [
   'half_time_switch',
   'impact_cut',
   'spinback',
+  'stutter_edit',
+  'reverse_riser_drop',
+  'lyric_link',
+  'key_change_lift',
+  'hook_over_groove',
 ];
 
 export const SAFE_TRANSITIONS = new Set([
@@ -89,7 +94,7 @@ export function inferGenreKey(track) {
 }
 
 export function normalizeSongAnalysis(track) {
-  const a = track.analysis || (Array.isArray(track.bars) ? track : {});
+  const a = track.analysis || track;
   const id = track.id || track.song_id || `track-${Math.random().toString(36).slice(2, 8)}`;
   const durationSec = Math.max(20, Number(a.duration_sec || a.durationSec || track.durationSec) || 210);
   const gKey = inferGenreKey(track);
@@ -227,12 +232,28 @@ export function normalizeSongAnalysis(track) {
     phrase_boundaries: phraseBoundaries,
     sections,
     key: a.key || track.key || null,
-    key_camelot: a.key_camelot || a.camelot || track.camelot || null,
-    key_confidence: Number(a.key_confidence ?? a.keyStrength ?? 0.6),
+    key_camelot: a.key_camelot || a.camelot || track.key_camelot || track.camelot || null,
+    key_confidence: Number(a.key_confidence ?? a.keyStrength ?? track.key_confidence ?? 0.6),
     energy_per_bar: energyPerBar,
     stem_activity: stemActivity,
     instrumental_gaps: instrumentalGaps,
     lyrics: Array.isArray(track.lyrics || a.lyrics) ? (track.lyrics || a.lyrics) : [],
+    language: track.language || a.language || null,
+    lyric_understanding: track.lyric_understanding || a.lyric_understanding || {
+      language: track.language || a.language || 'unknown',
+      romanised: '',
+      translation: '',
+      theme: playbook.label,
+      mood: (track.energy || 7) >= 8 ? 'hype' : 'groovy',
+      emotional_arc: 'rising',
+      hook_line: '',
+      hook_sec: null,
+      repeated_phrases: [],
+      call_and_response: '',
+      spoken_intro: (a.tempo_stability?.free_time_intro_sec || 0) >= 6,
+      explicit_flag: false,
+      do_not_cut_ranges: [],
+    },
     tags: a.tags || {
       genre: playbook.label,
       mood: (track.energy || 7) >= 8 ? 'energetic' : 'groovy',
@@ -242,7 +263,7 @@ export function normalizeSongAnalysis(track) {
     },
     genreKey: track.genreKey || gKey,
     warnings: Array.isArray(a.warnings) ? a.warnings : (track.warnings || (!track.dspReady && !track.isDsp ? ['youtube_metadata_grid'] : [])),
-    tempo_stability: a.tempo_stability || { drift_pct: 0, is_variable: false, free_time_intro_sec: 0 },
+    tempo_stability: a.tempo_stability || { drift_pct: 0, is_variable: false, free_time_intro_sec: 0, tempo_changes: [] },
     heat,
     isDsp: Boolean(track.file || track.isDsp || (track.dspReady && track.streamUrl)),
   };
@@ -303,7 +324,12 @@ function barSectionAt(song, barIdx) {
   return song.sections.find((s) => barIdx >= s.start_bar && barIdx < s.end_bar) || song.sections[0] || { type: 'verse', energy: 0.6 };
 }
 
-function getArcDir(arc = 'peak') {
+function getArcDir(arc = 'peak', moodEnergy = null) {
+  if (Number.isFinite(moodEnergy)) {
+    if (moodEnergy < 42) return -1;
+    if (moodEnergy > 68) return 1;
+    return 0;
+  }
   if (arc === 'warmup') return 1;
   if (arc === 'winddown') return -1;
   return 0; // peak / bangers hold high energy
@@ -314,7 +340,7 @@ function getArcDir(arc = 'peak') {
  * S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R
  * Returns top 5 ranked candidate transition mix points for the AI Planner.
  */
-export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'club' } = {}) {
+export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'club', moodEnergy = null } = {}) {
   const tempo = computeTempoFit(songA.bpm, songB.bpm);
   const keyFit = computeKeyFit(songA.key_camelot, songB.key_camelot);
 
@@ -363,8 +389,16 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
   }
   const uniqueIn = [...new Set(inCandidates)].slice(0, 3);
 
-  const arcDir = getArcDir(arc);
+  const arcDir = getArcDir(arc, moodEnergy);
   const unsafeSong = songA.warnings.includes('no_clear_beat') || songB.warnings.includes('no_clear_beat') || songA.warnings.includes('variable_tempo') || songB.warnings.includes('variable_tempo');
+
+  const overlapsProtectedRange = (song, barIdx) => {
+    const sec = song.bars?.[barIdx]?.start_sec;
+    if (!Number.isFinite(sec)) return false;
+    return (song.lyric_understanding?.do_not_cut_ranges || []).some(
+      (r) => sec > Number(r.start_sec) + 0.8 && sec < Number(r.end_sec) - 0.8
+    );
+  };
 
   const scored = [];
   for (const outBar of uniqueOut) {
@@ -419,7 +453,8 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
       }
 
       const rawScore = 0.25 * tempo.T + 0.2 * keyFit.K + 0.15 * E + 0.15 * P + 0.15 * V + 0.1 * G - R;
-      const S = Math.round(Math.max(0.05, Math.min(1, rawScore)) * 1000) / 1000;
+      const protPenalty = (overlapsProtectedRange(songA, outBar) || overlapsProtectedRange(songB, inBar)) ? 0.28 : 0;
+      const S = Math.round(Math.max(0.05, Math.min(1, rawScore - protPenalty)) * 1000) / 1000;
 
       scored.push({
         mix_out_bar: outBar,
@@ -452,6 +487,73 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
     bestScore: scored[0]?.score ?? 0.5,
     candidates: scored.slice(0, 5),
   };
+}
+
+/**
+ * Creativity Engine: generates 3 contrasting creative transition concepts for a pair,
+ * scores each on surprise, smoothness, and crowd_energy, and selects the winner.
+ */
+export function generateCreativeIdeas(songA, songB, cand, arc = 'peak') {
+  const sameKey = cand.key_distance === 0 || cand.key_distance === 1;
+  const dStyle = (GENRE_PLAYBOOKS[songB.genreKey] || GENRE_PLAYBOOKS.pop).drumStyle;
+  const idea1 = {
+    type: cand.type || 'bass_swap_blend',
+    idea: `${String(cand.type || 'bass_swap_blend').replace(/_/g, ' ')}: phrase-aligned downbeat handoff.`,
+    surprise: 0.65,
+    smoothness: Math.min(0.96, 0.72 + (cand.breakdown?.P || 0.7) * 0.24),
+    crowd_energy: arc === 'bangers' ? 0.85 : 0.78,
+  };
+  const idea2 = cand.unsafe
+    ? {
+        type: 'reverb_wash',
+        idea: 'Ambient reverb wash & low-pass melt into incoming downbeat.',
+        surprise: 0.62,
+        smoothness: 0.9,
+        crowd_energy: 0.72,
+      }
+    : sameKey && (songA.instrumental_gaps?.length || songB.instrumental_gaps?.length)
+      ? {
+          type: 'hook_over_groove',
+          idea: `Layer ${songB.title}'s vocal hook over ${songA.title}'s stripped drum & bass groove.`,
+          surprise: 0.92,
+          smoothness: 0.86,
+          crowd_energy: 0.9,
+        }
+      : {
+          type: 'reverse_riser_drop',
+          idea: `Reverse noise riser + 1/2-beat tension sweep slamming ${songB.title}'s chorus.`,
+          surprise: 0.86,
+          smoothness: 0.78,
+          crowd_energy: 0.93,
+        };
+  const idea3 = cand.unsafe
+    ? {
+        type: 'impact_cut',
+        idea: 'Clean Beat-1 sub impact cut with zero vocal bleed.',
+        surprise: 0.68,
+        smoothness: 0.82,
+        crowd_energy: 0.79,
+      }
+    : (songA.lyric_understanding?.theme && songB.lyric_understanding?.theme && songA.lyric_understanding.theme === songB.lyric_understanding.theme)
+      ? {
+          type: 'lyric_link',
+          idea: `Thematic call-and-response handoff across matching mood (${songA.lyric_understanding.theme}).`,
+          surprise: 0.94,
+          smoothness: 0.84,
+          crowd_energy: 0.86,
+        }
+      : {
+          type: 'drum_loop_bridge',
+          idea: `Lock an 8-bar quantized ${dStyle.toUpperCase()} groove bridge between ${songA.title} and ${songB.title}.`,
+          surprise: 0.84,
+          smoothness: 0.85,
+          crowd_energy: 0.84,
+        };
+
+  return [idea1, idea2, idea3].map((it) => ({
+    ...it,
+    total: Math.round((it.surprise * 0.34 + it.smoothness * 0.36 + it.crowd_energy * 0.3) * 1000) / 1000,
+  })).sort((a, b) => b.total - a.total);
 }
 
 /**
@@ -490,15 +592,47 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
       { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.05], [mid, 0.95], [len, 1]] },
     ];
     why = `Compatible Camelot lock & tight BPM -> extended ${len}-bar phrase blend with vocal handoff.`;
-  } else if (type === 'vocal_mashup' || type === 'acapella_in' || type === 'instrumental_in') {
+  } else if (type === 'vocal_mashup' || type === 'acapella_in' || type === 'instrumental_in' || type === 'hook_over_groove') {
     stem_layers = [
-      { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.15], [len, 0.02]] },
+      { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.14], [len, 0.02]] },
       { song: songA.song_id, stem: 'drums', start_bar: 0, end_bar: len, gain_curve: [[0, 1], [len - 2, 0.6], [len, 0]] },
-      { song: songA.song_id, stem: 'other', start_bar: 0, end_bar: len, gain_curve: [[0, 0.7], [len, 0]] },
+      { song: songA.song_id, stem: 'other', start_bar: 0, end_bar: len, gain_curve: [[0, type === 'hook_over_groove' ? 0.45 : 0.7], [len, 0]] },
       { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.95], [len, 1]] },
       { song: songB.song_id, stem: 'drums', start_bar: 0, end_bar: len, gain_curve: [[0, 0.25], [mid, 0.85], [len, 1]] },
     ];
-    why = `Instrumental gap & harmonic key fit -> layered B's vocals over A's instrumental cleanly with zero vocal clash.`;
+    why = type === 'hook_over_groove'
+      ? `Layered ${songB.title}'s hook vocal over ${songA.title}'s stripped drum & bass groove with zero clash.`
+      : `Instrumental gap & harmonic key fit -> layered B's vocals over A's instrumental cleanly with zero vocal clash.`;
+  } else if (type === 'stutter_edit') {
+    fx.push({ type: 'stutter', start_bar: Math.max(0, mid - 2), params: { division_beats: 0.25, repeats: 8 } });
+    filter_automation = [{ deck: 'A', curve: [[0, 0], [mid, 0.55], [len, 0.78]] }];
+    stem_layers = [
+      { song: songA.song_id, stem: 'all', start_bar: 0, end_bar: len, gain_curve: [[0, 1], [mid, 0.85], [mid + 1, 0]] },
+      { song: songB.song_id, stem: 'all', start_bar: 0, end_bar: len, gain_curve: [[0, 0.01], [mid - 0.1, 0.02], [mid, 1]] },
+    ];
+    why = `1/4-beat rhythmic stutter gate on ${songA.title} dropping squarely into ${songB.title}'s Beat 1.`;
+  } else if (type === 'reverse_riser_drop') {
+    fx.push({ type: 'reverse_riser', start_bar: 0, params: { drop_at_ratio: 0.75 } });
+    filter_automation = [{ deck: 'A', curve: [[0, 0], [len * 0.74, 0.76], [len, 0.85]] }];
+    stem_layers = [
+      { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.9], [len * 0.62, 0.12], [len, 0]] },
+      { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.04], [len * 0.74, 1], [len, 1]] },
+    ];
+    why = `Reversed breath & cymbal tension swell releasing cleanly onto ${songB.title}'s peak chorus downbeat.`;
+  } else if (type === 'lyric_link') {
+    fx.push({ type: 'echo', start_bar: Math.max(0, mid - 1), params: { feedback: 0.42, level: 0.45 } });
+    stem_layers = [
+      { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 1], [mid - 0.5, 0.92], [mid, 0.08], [len, 0]] },
+      { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.02], [mid - 0.1, 0.02], [mid, 1], [len, 1]] },
+    ];
+    why = `Thematic lyric handoff (${songA.lyric_understanding?.theme || 'call & response'}) preserving clean phrase boundaries.`;
+  } else if (type === 'key_change_lift') {
+    fx.push({ type: 'key_lift', start_bar: 0, params: { semitones: Math.max(-2, Math.min(2, cand.pitch_shift_semitones || 1)) } });
+    stem_layers = [
+      { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.85], [mid, 0.12], [len, 0]] },
+      { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.04], [mid, 0.96], [len, 1]] },
+    ];
+    why = `Harmonic +${Math.abs(cand.pitch_shift_semitones || 1)}st energy key-lift transition into ${songB.title}.`;
   } else if (type === 'filter_sweep') {
     filter_automation = [
       { deck: 'A', curve: [[0, 0], [len * 0.7, 0.72], [len, 0.85]] },
@@ -571,6 +705,7 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
     why = `Clean downbeat cut with sub-drop impact on Beat 1.`;
   }
 
+  const creativeCandidates = generateCreativeIdeas(songA, songB, cand);
   return {
     from: songA.song_id,
     to: songB.song_id,
@@ -588,6 +723,8 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
     filter_automation,
     fx,
     added_drums,
+    creative_idea: creativeCandidates.find((c) => c.type === type)?.idea || why,
+    creative_candidates: creativeCandidates,
     why,
     risk: cand.unsafe ? 'high' : cand.score >= 0.72 ? 'low' : 'medium',
     fallback: cand.unsafe ? 'echo_out' : 'bass_swap_blend',
@@ -701,11 +838,49 @@ export function validateTransitionRecipe(recipe, songA, songB) {
     if (actA * gA > 0.42 && actB * gB > 0.42) overlapVocalBars++;
   }
   if (overlapVocalBars > Math.max(2, len * 0.45)) {
-    warnings.push(`High simultaneous vocal activity (${overlapVocalBars} bars); ensure vocal ducking is active.`);
+    if (recipe.type === 'vocal_mashup' || recipe.type === 'hook_over_groove' || recipe.type === 'lyric_link') {
+      errors.push(`Two lead vocals clash for ${overlapVocalBars} bars during "${recipe.type}".`);
+    } else {
+      warnings.push(`High simultaneous vocal activity (${overlapVocalBars} bars); ensure vocal ducking is active.`);
+    }
+  }
+
+  // Protected lyric ranges check ("do not cut through" crucial sung phrases)
+  const outSec = songA.bars?.[recipe.mix_out_bar]?.start_sec;
+  if (Number.isFinite(outSec)) {
+    for (const r of songA.lyric_understanding?.do_not_cut_ranges || []) {
+      if (outSec > Number(r.start_sec) + 0.8 && outSec < Number(r.end_sec) - 0.8) {
+        errors.push(`Mix-out at ${outSec.toFixed(1)}s cuts through protected lyric phrase (${r.reason || 'hook'}).`);
+        break;
+      }
+    }
+  }
+  const inSec = songB.bars?.[recipe.mix_in_bar]?.start_sec;
+  if (Number.isFinite(inSec)) {
+    for (const r of songB.lyric_understanding?.do_not_cut_ranges || []) {
+      if (inSec > Number(r.start_sec) + 0.8 && inSec < Number(r.end_sec) - 0.8) {
+        errors.push(`Mix-in at ${inSec.toFixed(1)}s lands inside protected lyric phrase (${r.reason || 'hook'}).`);
+        break;
+      }
+    }
+  }
+
+  // Clipping headroom guard across full-mix overlaps
+  for (let i = 0; i <= 4; i++) {
+    const bOff = (len * i) / 4;
+    const alA = (recipe.stem_layers || []).find((s) => s.song === songA.song_id && s.stem === 'all');
+    const alB = (recipe.stem_layers || []).find((s) => s.song === songB.song_id && s.stem === 'all');
+    if (alA && alB) {
+      const gSum = sampleGain(alA.gain_curve, bOff, 0.5) + sampleGain(alB.gain_curve, bOff, 0.5);
+      if (gSum > 1.88) {
+        errors.push(`Summed deck gain (${gSum.toFixed(2)}) risks digital clipping at offset ${bOff.toFixed(1)} bars.`);
+        break;
+      }
+    }
   }
 
   // Harmonic key rule for layered melodic stems
-  if (songA.key_camelot && songB.key_camelot && (recipe.type === 'vocal_mashup' || recipe.type === 'long_blend')) {
+  if (songA.key_camelot && songB.key_camelot && (recipe.type === 'vocal_mashup' || recipe.type === 'long_blend' || recipe.type === 'hook_over_groove')) {
     const dist = camelotDistance(songA.key_camelot, shiftCamelot(songB.key_camelot, semi));
     if (dist > 1) {
       errors.push(`Melodic layered type "${recipe.type}" requires shifted Camelot distance <= 1 (got ${dist}).`);
@@ -756,7 +931,7 @@ export function validateSetPlan(plan, songsMap) {
 /**
  * PHASE 2 BUILT-IN PLANNER (Running Order TSP + Top 5 Pair Scoring + Validated Recipes)
  */
-export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club' } = {}) {
+export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moodEnergy = null } = {}) {
   const analyses = tracks.map((t) => normalizeSongAnalysis(t));
   const map = {};
   for (const a of analyses) map[a.song_id] = a;
@@ -792,7 +967,7 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club' } = 
     let bestVal = -Infinity;
     for (let i = 0; i < pool.length; i++) {
       const cand = pool[i];
-      const { bestScore } = scorePairCandidates(prev, cand, { arc: vibe, playMode });
+      const { bestScore } = scorePairCandidates(prev, cand, { arc: vibe, playMode, moodEnergy });
       let adj = bestScore;
       const a1 = String(prev.artist || '').toLowerCase().split(/[,&]/)[0].trim();
       const a2 = String(cand.artist || '').toLowerCase().split(/[,&]/)[0].trim();
@@ -811,7 +986,7 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club' } = 
   for (let i = 0; i < ordered.length - 1; i++) {
     const songA = ordered[i];
     const songB = ordered[i + 1];
-    const { candidates } = scorePairCandidates(songA, songB, { arc: vibe, playMode });
+    const { candidates } = scorePairCandidates(songA, songB, { arc: vibe, playMode, moodEnergy });
     let recipe = buildRecipeFromCandidate(songA, songB, candidates[0]);
     const v = validateTransitionRecipe(recipe, songA, songB);
     if (!v.valid) {

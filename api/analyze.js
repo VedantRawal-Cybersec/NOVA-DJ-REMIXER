@@ -1,7 +1,9 @@
 import { getQueryParams, handlePreflight, readJsonBody, sendJson } from './_lib/http.js';
+import { loadServerEnv } from './_lib/env.js';
 
 export default async function handler(req, res) {
   if (handlePreflight(req, res)) return;
+  loadServerEnv();
 
   const workerUrl = String(process.env.AUDIO_WORKER_URL || '').trim().replace(/\/+$/, '');
   if (!workerUrl) {
