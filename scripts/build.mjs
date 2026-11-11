@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { generateStudioDrumPack } from './generate-drum-pack.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const vendorDir = path.join(root, 'public', 'vendor');
@@ -35,4 +36,6 @@ const indexHtml = path.join(root, 'public', 'index.html');
 if (!fs.existsSync(indexHtml)) {
   throw new Error('Missing public/index.html');
 }
+const drumFiles = generateStudioDrumPack();
+console.log(`Generated ${drumFiles.length} royalty-free studio percussion samples in public/samples/.`);
 console.log('NOVA AI DJ v2 build completed successfully.');

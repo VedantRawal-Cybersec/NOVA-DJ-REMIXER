@@ -1,15 +1,10 @@
 /**
- * Studio-transparent Mid-Side Stem Matrix + 4-Band Isolator + 3-Band Kill EQ + Color Filter.
- *
- * Math check (Zero-coloration at unity):
- *   Mid  = 0.5*(L + R)   (contains Bass, Kick/Snare, Center Lead Vocals)
- *   Side = 0.5*(L - R)   (contains Stereo Synths, Guitars, Harmonies = "Other")
- *   Since Mid + Side === L and Mid - Side === R identically when Side/Mid gains == 1.0,
- *   the channel strip is 100% bit-transparent at unity while enabling surgical
- *   Center-Vocal suppression vs Stereo-Backing ("Other") isolation + -36 dB EQ kills!
+ * Dual-Mode Pro Channel Strip:
+ * 1) True 4-Stem Neural Multi-Lane Mode (Demucs vocals/drums/bass/other WAV lanes -> dedicated Gains -> Master Strip)
+ * 2) Bit-Transparent Mid-Side Matrix + 4-Band Spectral Isolator fallback for single-file audio.
  */
 function gainToDb(gain) {
-  const g = Math.max(0.001, Math.min(2.0, Number(gain)));
+  const g = Math.max(0.0005, Math.min(2.0, Number(gain)));
   if (Math.abs(g - 1) < 0.005) return 0;
   if (g < 1) return Math.max(-36, 20 * Math.log10(g));
   return Math.min(6, 20 * Math.log10(g));
@@ -18,54 +13,6 @@ function gainToDb(gain) {
 export function createStemChannelStrip(ctx, destination) {
   const input = ctx.createGain();
   input.gain.value = 1;
-
-  // True Mid-Side Matrix before EQ
-  const splitter = ctx.createChannelSplitter(2);
-  const merger = ctx.createChannelMerger(2);
-
-  // Mid = (L + R) * 0.5 into both L/R
-  const midL = ctx.createGain();
-  const midR = ctx.createGain();
-  midL.gain.value = 0.5;
-  midR.gain.value = 0.5;
-  const midCenter = ctx.createGain();
-  midCenter.gain.value = 1.0;
-
-  // Center-Vocal cancellation band on Mid only (does NOT mute stereo instruments!)
-  const midVocalBand = ctx.createBiquadFilter();
-  midVocalBand.type = 'peaking';
-  midVocalBand.frequency.value = 1350;
-  midVocalBand.Q.value = 0.65;
-  midVocalBand.gain.value = 0;
-
-  // Side = (L - R) * 0.5 (L gets +Side, R gets -Side)
-  const sidePosL = ctx.createGain();
-  const sideNegR = ctx.createGain();
-  sidePosL.gain.value = 0.5;
-  sideNegR.gain.value = -0.5;
-  const sideGain = ctx.createGain();
-  sideGain.gain.value = 1.0;
-  const sideInvertToR = ctx.createGain();
-  sideInvertToR.gain.value = -1.0;
-
-  input.connect(splitter);
-  // L (0) and R (1) into Mid
-  splitter.connect(midL, 0);
-  splitter.connect(midR, 1);
-  midL.connect(midCenter);
-  midR.connect(midCenter);
-  midCenter.connect(midVocalBand);
-  midVocalBand.connect(merger, 0, 0);
-  midVocalBand.connect(merger, 0, 1);
-
-  // L (0) and R (1) into Side
-  splitter.connect(sidePosL, 0);
-  splitter.connect(sideNegR, 1);
-  sidePosL.connect(sideGain);
-  sideNegR.connect(sideGain);
-  sideGain.connect(merger, 0, 0);
-  sideGain.connect(sideInvertToR);
-  sideInvertToR.connect(merger, 0, 1);
 
   // Color Filter (DJ Sweep: LowPass < 0 or HighPass > 0)
   const hpf = ctx.createBiquadFilter();
@@ -95,7 +42,7 @@ export function createStemChannelStrip(ctx, destination) {
   eqHigh.frequency.value = 4200;
   eqHigh.gain.value = 0;
 
-  // 4-Band Spectral Stem Isolator bands (Bass < 145Hz, Drums 280Hz, Air > 4.5kHz)
+  // Spectral Stem Bands (used in single-stereo mode)
   const bassBand = ctx.createBiquadFilter();
   bassBand.type = 'lowshelf';
   bassBand.frequency.value = 145;
@@ -112,6 +59,61 @@ export function createStemChannelStrip(ctx, destination) {
   airBand.frequency.value = 4500;
   airBand.gain.value = 0;
 
+  // Mid-Side Matrix for single-stereo center vocal vs stereo other isolation
+  const splitter = ctx.createChannelSplitter(2);
+  const merger = ctx.createChannelMerger(2);
+  const midL = ctx.createGain();
+  const midR = ctx.createGain();
+  midL.gain.value = 0.5;
+  midR.gain.value = 0.5;
+  const midCenter = ctx.createGain();
+  midCenter.gain.value = 1.0;
+
+  const midVocalBand = ctx.createBiquadFilter();
+  midVocalBand.type = 'peaking';
+  midVocalBand.frequency.value = 1350;
+  midVocalBand.Q.value = 0.65;
+  midVocalBand.gain.value = 0;
+
+  const sidePosL = ctx.createGain();
+  const sideNegR = ctx.createGain();
+  sidePosL.gain.value = 0.5;
+  sideNegR.gain.value = -0.5;
+  const sideGain = ctx.createGain();
+  sideGain.gain.value = 1.0;
+  const sideInvertToR = ctx.createGain();
+  sideInvertToR.gain.value = -1.0;
+
+  input.connect(splitter);
+  splitter.connect(midL, 0);
+  splitter.connect(midR, 1);
+  midL.connect(midCenter);
+  midR.connect(midCenter);
+  midCenter.connect(midVocalBand);
+  midVocalBand.connect(merger, 0, 0);
+  midVocalBand.connect(merger, 0, 1);
+
+  splitter.connect(sidePosL, 0);
+  splitter.connect(sideNegR, 1);
+  sidePosL.connect(sideGain);
+  sideNegR.connect(sideGain);
+  sideGain.connect(merger, 0, 0);
+  sideGain.connect(sideInvertToR);
+  sideInvertToR.connect(merger, 0, 1);
+  merger.connect(hpf);
+
+  // True 4-Stem Neural Multi-Lane Inputs (vocals, drums, bass, other) -> independent zero-bleed GainNodes -> shared HPF
+  const stemInputs = {
+    vocals: ctx.createGain(),
+    drums: ctx.createGain(),
+    bass: ctx.createGain(),
+    other: ctx.createGain(),
+  };
+  for (const gNode of Object.values(stemInputs)) {
+    gNode.gain.value = 1.0;
+    gNode.connect(hpf);
+  }
+
   // Main deck fader + LUFS auto-gain trim
   const deckVolume = ctx.createGain();
   deckVolume.gain.value = 1;
@@ -119,7 +121,6 @@ export function createStemChannelStrip(ctx, destination) {
   const lufsTrim = ctx.createGain();
   lufsTrim.gain.value = 1;
 
-  merger.connect(hpf);
   hpf.connect(lpf);
   lpf.connect(eqLow);
   eqLow.connect(eqMid);
@@ -131,7 +132,6 @@ export function createStemChannelStrip(ctx, destination) {
   deckVolume.connect(lufsTrim);
   lufsTrim.connect(destination);
 
-  // Post-fader FX sends (echo tail rings cleanly after deck fades out!)
   const echoSend = ctx.createGain();
   echoSend.gain.value = 0;
   lufsTrim.connect(echoSend);
@@ -141,6 +141,7 @@ export function createStemChannelStrip(ctx, destination) {
   lufsTrim.connect(reverbSend);
 
   const state = {
+    neuralMode: false,
     bass: 1,
     drums: 1,
     vocals: 1,
@@ -151,12 +152,30 @@ export function createStemChannelStrip(ctx, destination) {
     eqHigh: 0,
   };
 
-  function setStem(name, targetGain, atTime = ctx.currentTime, rampSec = 0.04) {
-    const g = Math.max(0.001, Math.min(2.0, Number(targetGain)));
-    const db = gainToDb(g);
-    state[name] = g;
-    const tc = Math.max(0.012, rampSec);
+  function setNeuralMode(enabled, atTime = ctx.currentTime) {
+    state.neuralMode = Boolean(enabled);
+    if (state.neuralMode) {
+      // Ensure spectral bands stay flat so isolated Demucs stems suffer zero coloration
+      midVocalBand.gain.setTargetAtTime(0, atTime, 0.015);
+      bassBand.gain.setTargetAtTime(0, atTime, 0.015);
+      drumsBand.gain.setTargetAtTime(0, atTime, 0.015);
+      airBand.gain.setTargetAtTime(0, atTime, 0.015);
+      sideGain.gain.setTargetAtTime(1.0, atTime, 0.015);
+    }
+  }
 
+  function setStem(name, targetGain, atTime = ctx.currentTime, rampSec = 0.04) {
+    const g = Math.max(0.0005, Math.min(2.0, Number(targetGain)));
+    const tc = Math.max(0.012, rampSec);
+    state[name] = g;
+
+    if (state.neuralMode && stemInputs[name]) {
+      stemInputs[name].gain.cancelScheduledValues(atTime);
+      stemInputs[name].gain.setTargetAtTime(g, atTime, tc);
+      return;
+    }
+
+    const db = gainToDb(g);
     if (name === 'vocals') {
       midVocalBand.gain.cancelScheduledValues(atTime);
       midVocalBand.gain.setTargetAtTime(db, atTime, tc);
@@ -213,6 +232,10 @@ export function createStemChannelStrip(ctx, destination) {
   }
 
   function resetAll(atTime = ctx.currentTime) {
+    for (const gNode of Object.values(stemInputs)) {
+      gNode.gain.cancelScheduledValues(atTime);
+      gNode.gain.setTargetAtTime(1.0, atTime, 0.02);
+    }
     setStem('bass', 1, atTime, 0.04);
     setStem('drums', 1, atTime, 0.04);
     setStem('vocals', 1, atTime, 0.04);
@@ -229,6 +252,7 @@ export function createStemChannelStrip(ctx, destination) {
 
   return {
     input,
+    stemInputs,
     output: lufsTrim,
     deckVolume,
     lufsTrim,
@@ -241,6 +265,7 @@ export function createStemChannelStrip(ctx, destination) {
     echoSend,
     reverbSend,
     state,
+    setNeuralMode,
     setStem,
     setEqBand,
     setColorFilter,

@@ -265,7 +265,7 @@ export function normalizeSongAnalysis(track) {
     warnings: Array.isArray(a.warnings) ? a.warnings : (track.warnings || (!track.dspReady && !track.isDsp ? ['youtube_metadata_grid'] : [])),
     tempo_stability: a.tempo_stability || { drift_pct: 0, is_variable: false, free_time_intro_sec: 0, tempo_changes: [] },
     heat,
-    isDsp: Boolean(track.file || track.isDsp || (track.dspReady && track.streamUrl)),
+    isDsp: Boolean(track.file || track.stemFiles || track.stemUrls || track.neuralStems || track.isDsp || (track.dspReady && track.streamUrl)),
   };
 }
 
@@ -355,22 +355,23 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
   if (songA.warnings.includes('low_confidence') || songB.warnings.includes('low_confidence')) R += 0.05;
   R = Math.min(0.3, Math.round(R * 1000) / 1000);
 
-  // Build candidate mix-out bars in A & mix-in bars in B
+  // Build candidate mix-out bars in A & mix-in bars in B (strictly bounded within short & long songs)
   const outCandidates = [];
-  if (playMode === 'hooks') {
-    const mid = Math.min(songA.bar_count - 8, Math.max(8, Math.round(songA.bar_count * 0.55)));
-    outCandidates.push(Math.max(8, mid - (mid % 8)));
+  const maxSafeOut = Math.max(1, songA.bar_count - 4);
+  if (playMode === 'hooks' && songA.bar_count >= 12) {
+    const mid = Math.min(maxSafeOut, Math.max(4, Math.round(songA.bar_count * 0.55)));
+    outCandidates.push(Math.min(maxSafeOut, Math.max(4, mid - (mid % 8))));
   }
   const latePhrase = songA.phrase_boundaries
     .map((p) => p.bar)
-    .filter((b) => b >= Math.max(8, songA.bar_count - 40) && b <= Math.max(8, songA.bar_count - 12));
+    .filter((b) => b >= Math.max(4, songA.bar_count - 40) && b <= Math.max(4, songA.bar_count - 8) && b <= maxSafeOut);
   for (const b of latePhrase) outCandidates.push(b);
   const outroSec = songA.sections.find((s) => s.type === 'outro');
-  if (outroSec && outroSec.start_bar >= 8 && outroSec.start_bar <= songA.bar_count - 8) {
+  if (outroSec && outroSec.start_bar >= 4 && outroSec.start_bar <= maxSafeOut) {
     outCandidates.push(outroSec.start_bar);
   }
   if (!outCandidates.length) {
-    outCandidates.push(Math.max(4, songA.bar_count - 16));
+    outCandidates.push(Math.min(maxSafeOut, Math.max(1, Math.floor(songA.bar_count * 0.5))));
   }
   const uniqueOut = [...new Set(outCandidates)].slice(0, 4);
 
@@ -1017,4 +1018,82 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
     energy_flow: Math.round((transitions.reduce((acc, r) => acc + (r.compatibility?.breakdown?.E ?? 0.75), 0) / Math.max(1, transitions.length)) * 100),
   };
   return plan;
+}
+
+/**
+ * Tap-Tempo & Beat-1 Phase Calibration Override:
+ * Shifts downbeats cleanly for Indian free-time intros / offbeat Bar-1 grids and rebuilds phrase maps.
+ */
+export function applyManualGridOverride(song, { tapBpm = null, nudgeBeats = 0, nudgeMs = 0, bpmMultiplier = 1 } = {}) {
+  const a = normalizeSongAnalysis(song);
+  const dur = Math.max(12, Number(a.duration_sec) || 180);
+  const prevBpm = a.bpm || 120;
+  let newBpm = tapBpm ? Number(tapBpm) : prevBpm * (Number(bpmMultiplier) || 1);
+  newBpm = Math.round(Math.max(55, Math.min(210, newBpm)) * 10) / 10;
+
+  const beatSec = 60 / newBpm;
+  const barSec = beatSec * 4;
+  const prevBeatSec = 60 / prevBpm;
+  const curAnchor = a.downbeat_times?.[0] ?? a.bars?.[0]?.start_sec ?? 0;
+  const newAnchor = Math.max(0, Math.min(dur * 0.45, Math.round((curAnchor + nudgeBeats * prevBeatSec + nudgeMs / 1000) * 1000) / 1000));
+
+  const beats = [];
+  for (let t = newAnchor; t < dur - 0.1; t += beatSec) beats.push(Math.round(t * 1000) / 1000);
+  const downbeats = [];
+  const bars = [];
+  for (let t = newAnchor; t < dur - 0.35; t += barSec) {
+    const start_sec = Math.round(t * 1000) / 1000;
+    const end_sec = Math.round(Math.min(dur, t + barSec) * 1000) / 1000;
+    if (end_sec - start_sec >= 0.35) {
+      downbeats.push(start_sec);
+      bars.push({ bar: bars.length, start_sec, end_sec });
+    }
+  }
+  const barCount = Math.max(1, bars.length);
+
+  const resampleArr = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return bars.map(() => 0.6);
+    return bars.map((_, i) => arr[Math.min(arr.length - 1, Math.floor((i / barCount) * arr.length))]);
+  };
+
+  const stem_activity = {
+    vocals: resampleArr(a.stem_activity?.vocals),
+    drums: resampleArr(a.stem_activity?.drums),
+    bass: resampleArr(a.stem_activity?.bass),
+    other: resampleArr(a.stem_activity?.other),
+    drum_density: resampleArr(a.stem_activity?.drums),
+    bass_presence: resampleArr(a.stem_activity?.bass),
+  };
+
+  const sections = (a.sections || []).map((s) => ({
+    ...s,
+    start_bar: Math.max(0, Math.min(barCount - 1, Math.round(Math.max(0, (s.start_sec || 0) - newAnchor) / barSec))),
+    end_bar: Math.max(1, Math.min(barCount, Math.round(Math.max(barSec, (s.end_sec || dur) - newAnchor) / barSec))),
+  }));
+
+  const phrase_boundaries = bars
+    .filter((_, i) => i % 8 === 0)
+    .map((b) => ({ bar: b.bar, sec: b.start_sec, multiple: b.bar % 32 === 0 ? 32 : b.bar % 16 === 0 ? 16 : 8 }));
+
+  return {
+    ...a,
+    bpm: newBpm,
+    bpm_confidence: 0.96,
+    bpmConfidence: 0.96,
+    downbeat_confidence: 0.95,
+    beat_times: beats,
+    beats,
+    downbeat_times: downbeats,
+    downbeats,
+    bar_count: barCount,
+    bars,
+    phrase_boundaries,
+    sections,
+    energy_per_bar: resampleArr(a.energy_per_bar),
+    stem_activity,
+    warnings: (a.warnings || []).filter((w) => w !== 'no_clear_beat' && w !== 'low_confidence'),
+    manualOverride: { bpm: newBpm, anchorSec: newAnchor },
+    clubEntry: downbeats[0] ?? 0,
+    clubExit: Math.max((downbeats[0] ?? 0) + barSec * 4, Math.round((dur - Math.min(28, barSec * 8)) * 100) / 100),
+  };
 }

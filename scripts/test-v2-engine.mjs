@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   TRANSITION_TYPES,
+  applyManualGridOverride,
   buildRecipeFromCandidate,
   generateCreativeIdeas,
   normalizeSongAnalysis,
@@ -109,5 +110,15 @@ assert.ok(octRec.candidates[0].bpm_diff_pct < 1, 'Half/double time 190 vs 95 mus
 
 const setCheck = validateSetPlan({ transitions: plan.transitions }, { s1: songA, s2: songB, s3: songC, s4: songD });
 assert.equal(setCheck.valid, true);
+
+// 5. Tap-Tempo & Beat-1 Nudge Calibration Override
+const nudged = applyManualGridOverride(songA, { nudgeBeats: 1, nudgeMs: 25 });
+assert.ok(nudged.downbeat_times[0] > 0.45 && nudged.downbeat_times[0] < 0.6);
+assert.equal(nudged.bar_count, nudged.bars.length);
+const tapped = applyManualGridOverride(songC, { bpmMultiplier: 0.5 });
+assert.equal(tapped.bpm, 95);
+const explicitTap = applyManualGridOverride(songB, { tapBpm: 128.5 });
+assert.equal(explicitTap.bpm, 128.5);
+assert.equal(explicitTap.bpm_confidence, 0.96);
 
 console.log('ALL V2 BRAIN, CREATIVITY & VALIDATOR UNIT TESTS PASSED ✓');

@@ -33,8 +33,9 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST') {
-      const body = await readJsonBody(req);
-      const r = await fetch(`${workerUrl}/analyze-url`, {
+      const body = await readJsonBody(req, 4.5 * 1024 * 1024);
+      const endpoint = body?.audioBase64 ? `${workerUrl}/analyze-b64` : `${workerUrl}/analyze-url`;
+      const r = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

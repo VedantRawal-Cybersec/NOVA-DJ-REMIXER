@@ -157,7 +157,7 @@ export class NovaOrchestrator {
   }
 
   #isDspTrack(track) {
-    return Boolean(track && (track.file || (track.dspReady && track.streamUrl)));
+    return Boolean(track && (track.file || track.stemFiles || track.stemUrls || (track.dspReady && track.streamUrl)));
   }
 
   async startSet(tracks, { vibe = 'peak', playMode = 'club', recipes = [], ytCrossfadeSec = 5.5, ytTransitionStyle = 'phrase', ytFxEnabled = true } = {}) {

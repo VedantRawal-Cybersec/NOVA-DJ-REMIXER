@@ -84,10 +84,10 @@ function renderSongGridSvg(analysis, mixOutBar = null, mixInBar = null) {
   </svg>`;
 }
 
-export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg, previewBusyIdx, auditBusyIdx, ratingsMap }) {
+export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg, previewBusyIdx, auditBusyIdx, batchAuditBusy, tapState, ratingsMap }) {
   const analyses = plan?.analyses || [];
   const transitions = plan?.transitions || [];
-  const dspCount = tracks.filter((t) => t.file || t.dspReady).length;
+  const dspCount = tracks.filter((t) => t.file || t.stemFiles || t.dspReady).length;
 
   return `
     <div class="modal-backdrop" id="debug-backdrop">
@@ -102,6 +102,11 @@ export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg
             </div>
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            ${(dspCount >= 2 && transitions.length) ? `
+              <button id="btn-audit-all-debug" class="pill-btn squeeze" style="border-color:var(--accent);color:var(--accent)" ${batchAuditBusy || auditBusyIdx >= 0 ? 'disabled' : ''}>
+                ${batchAuditBusy ? 'AUDITING ALL…' : `🎧 AUDIT ALL (${transitions.length})`}
+              </button>
+            ` : ''}
             <button id="btn-export-wav-debug" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)" ${exportBusy || !dspCount ? 'disabled' : ''}>
               ${exportBusy ? 'RENDERING .WAV…' : '⬇ EXPORT MIX (.WAV)'}
             </button>
@@ -201,12 +206,14 @@ export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg
                 const inRec = transitions.find((r) => r.to === a.song_id);
                 const lu = a.lyric_understanding || {};
                 const protCount = lu.do_not_cut_ranges?.length || 0;
+                const isTapHere = tapState?.idx === idx && tapState.count > 0;
                 return `
                   <div style="border:1px solid rgba(245,245,240,0.12);border-radius:14px;padding:12px">
                     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-bottom:8px">
                       <span style="font-weight:600">${idx + 1}. ${escHtml(a.title)} <span style="opacity:0.55">· ${escHtml(a.artist)}</span></span>
                       <span class="font-mono-num" style="font-size:12px;color:var(--amber)">
                         ${a.bpm} BPM · ${a.key_camelot || 'NO KEY'} · ${a.bar_count} BARS · ${a.instrumental_gaps?.length || 0} GAPS
+                        ${a.neuralStems ? ' · NEURAL 4-STEM ✓' : ''}
                         ${lu.language ? ` · ${escHtml(String(lu.language).toUpperCase())}` : ''}
                         ${protCount ? ` · 🛡 ${protCount} PROTECTED` : ''}
                         ${lu.explicit_flag ? ' · EXPLICIT' : ''}
@@ -214,6 +221,18 @@ export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg
                       </span>
                     </div>
                     ${renderSongGridSvg(a, outRec?.mix_out_bar ?? null, inRec?.mix_in_bar ?? null)}
+                    <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                      <span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.48)">BEAT-1 CALIBRATE:</span>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-beats="${idx}" data-delta="-1">◀ -1 BEAT</button>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-beats="${idx}" data-delta="1">+1 BEAT ▶</button>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-ms="${idx}" data-delta="-20">◀ -20ms</button>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-ms="${idx}" data-delta="20">+20ms ▶</button>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-grid-mult="${idx}" data-mult="0.5">÷2</button>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-grid-mult="${idx}" data-mult="2">×2</button>
+                      <button class="pill-btn squeeze ${isTapHere ? 'active' : ''}" style="font-size:11px;padding:2px 10px;border-color:var(--amber);color:var(--amber)" data-tap-bpm="${idx}">
+                        🥁 ${isTapHere ? `TAP (${tapState.count}): ${tapState.bpm || '…'} BPM` : 'TAP BPM'}
+                      </button>
+                    </div>
                     ${(a.lyrics?.length || lu.translation || lu.hook_line) ? `
                       <div style="margin-top:8px;font-size:12px;color:rgba(245,245,240,0.72);line-height:1.45">
                         ${lu.hook_line ? `<div><strong class="text-amber">Hook:</strong> "${escHtml(lu.hook_line)}" · <strong>Theme:</strong> ${escHtml(lu.theme || '')} (${escHtml(lu.mood || '')})</div>` : ''}

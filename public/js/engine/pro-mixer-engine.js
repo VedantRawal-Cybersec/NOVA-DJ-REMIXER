@@ -1,5 +1,8 @@
 import { getHarmonicMatch } from './camelot.js';
+import { loadDrumSamplesForContext, scheduleStudioDrumBridge } from './drum-pack.js';
 import { createStemChannelStrip } from './stems-isolator.js';
+
+const STEM_NAMES = ['vocals', 'drums', 'bass', 'other'];
 
 function clampRecipeRate(rate, recipeType) {
   if (!Number.isFinite(rate) || rate <= 0) return 1;
@@ -40,10 +43,11 @@ export class ProMixerEngine {
     this.worker = null;
     this.workerReqId = 0;
     this.workerPending = new Map();
-    this.decodedCache = new Map(); // id -> { buffer, analysis }
+    this.decodedCache = new Map(); // id -> { buffer, stemBuffers?, analysis }
 
     this.decks = { A: null, B: null };
     this.drumSamples = null;
+    this.workerConfigured = false;
     this.drumBridgeEnabled = false;
     this.masterTempoEnabled = true;
     this.autoKeyLockEnabled = true;
@@ -121,9 +125,13 @@ export class ProMixerEngine {
 
       this.decks.A = await this.#createDeck('A');
       this.decks.B = await this.#createDeck('B');
+      this.drumSamples = await loadDrumSamplesForContext(this.ctx).catch(() => null);
     }
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
+    }
+    if (!this.drumSamples) {
+      this.drumSamples = await loadDrumSamplesForContext(this.ctx).catch(() => null);
     }
   }
 
@@ -159,9 +167,13 @@ export class ProMixerEngine {
       id,
       strip,
       stretch,
+      stemStretches: null,
+      neuralStems: false,
       fallbackSource: null,
+      stemFallbackSources: [],
       track: null,
       buffer: null,
+      stemBuffers: null,
       analysis: null,
       position: 0,
       rate: 1,
@@ -176,10 +188,39 @@ export class ProMixerEngine {
 
     if (stretch) {
       stretch.setUpdateInterval(0.05, (inputTime) => {
-        if (deck.playing) deck.position = inputTime;
+        if (deck.playing && !deck.neuralStems) deck.position = inputTime;
       });
     }
     return deck;
+  }
+
+  #getDeckStretches(deck) {
+    if (!deck) return [];
+    if (deck.neuralStems && deck.stemStretches) {
+      return STEM_NAMES.map((s) => deck.stemStretches[s]).filter(Boolean);
+    }
+    return deck.stretch ? [deck.stretch] : [];
+  }
+
+  async #ensureStemStretches(deck) {
+    if (deck.stemStretches) return deck.stemStretches;
+    const SignalsmithStretch = await loadSignalsmith();
+    const map = {};
+    await Promise.all(
+      STEM_NAMES.map(async (stem) => {
+        const st = await SignalsmithStretch(this.ctx);
+        await st.configure({ blockMs: 90, intervalMs: 22, splitComputation: true });
+        st.connect(deck.strip.stemInputs[stem]);
+        if (stem === 'drums') {
+          st.setUpdateInterval(0.05, (inputTime) => {
+            if (deck.playing && deck.neuralStems) deck.position = inputTime;
+          });
+        }
+        map[stem] = st;
+      })
+    );
+    deck.stemStretches = map;
+    return map;
   }
 
   #ensureWorker() {
@@ -197,6 +238,40 @@ export class ProMixerEngine {
     return this.worker;
   }
 
+  async #fetchAndDecodeStemPaths(stemsMap, baseProxy = true) {
+    const decoded = {};
+    await Promise.all(
+      STEM_NAMES.map(async (s) => {
+        const p = stemsMap?.[s];
+        if (!p) return;
+        const url = baseProxy ? `/api/analyze?stemPath=${encodeURIComponent(p)}` : p;
+        const r = await fetch(url);
+        if (!r.ok) return;
+        const ab = await r.arrayBuffer();
+        decoded[s] = await this.ctx.decodeAudioData(ab);
+      })
+    );
+    return STEM_NAMES.every((s) => decoded[s]) ? decoded : null;
+  }
+
+  #sumStemBuffers(stemBuffers) {
+    const ref = stemBuffers.drums || stemBuffers.vocals;
+    const numCh = Math.min(2, Math.max(1, ref.numberOfChannels));
+    const len = ref.length;
+    const sum = this.ctx.createBuffer(numCh, len, ref.sampleRate);
+    for (let c = 0; c < numCh; c++) {
+      const dst = sum.getChannelData(c);
+      for (const s of STEM_NAMES) {
+        const src = stemBuffers[s]?.getChannelData(Math.min(c, stemBuffers[s].numberOfChannels - 1));
+        if (!src) continue;
+        const n = Math.min(len, src.length);
+        for (let i = 0; i < n; i++) dst[i] += src[i];
+      }
+      for (let i = 0; i < len; i++) dst[i] = Math.max(-0.99, Math.min(0.99, dst[i]));
+    }
+    return sum;
+  }
+
   async decodeAndAnalyze(track, onProgress) {
     if (this.decodedCache.has(track.id)) {
       return this.decodedCache.get(track.id);
@@ -204,21 +279,59 @@ export class ProMixerEngine {
     await this.ensureContext();
     onProgress?.(`Decoding ${track.title}…`);
 
-    let bytes;
+    let stemBuffers = null;
+    let workerAnalysis = null;
+
+    // Path A: User dropped a 4-stem Demucs bundle (*_vocals, *_drums, *_bass, *_other)
+    if (track.stemFiles && STEM_NAMES.every((s) => track.stemFiles[s])) {
+      onProgress?.(`Decoding 4 isolated Demucs stems for ${track.title}…`);
+      stemBuffers = {};
+      await Promise.all(
+        STEM_NAMES.map(async (s) => {
+          const ab = await track.stemFiles[s].arrayBuffer();
+          stemBuffers[s] = await this.ctx.decodeAudioData(ab);
+        })
+      );
+    } else if (track.stemUrls && STEM_NAMES.every((s) => track.stemUrls[s])) {
+      onProgress?.(`Fetching 4 neural stems for ${track.title}…`);
+      stemBuffers = await this.#fetchAndDecodeStemPaths(track.stemUrls, false).catch(() => null);
+    } else if (track.analysis?.stems && STEM_NAMES.every((s) => track.analysis.stems[s])) {
+      stemBuffers = await this.#fetchAndDecodeStemPaths(track.analysis.stems, true).catch(() => null);
+    } else if (this.workerConfigured && track.streamUrl) {
+      // Path B: Optional Python GPU Worker via /api/analyze (Demucs + WhisperX + Multi-Tracker)
+      try {
+        onProgress?.(`Running GPU Demucs 4-stem extraction for ${track.title}…`);
+        const wr = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: track.streamUrl, song_id: track.id, filename: `${track.title}.mp3` }),
+        });
+        const wd = wr.ok ? await wr.json() : null;
+        if (wd?.stems) {
+          workerAnalysis = wd;
+          stemBuffers = await this.#fetchAndDecodeStemPaths(wd.stems, true).catch(() => null);
+        }
+      } catch {}
+    }
+
+    let buffer = null;
     if (track.file) {
       if (track.file.size > 180 * 1024 * 1024) {
         throw new Error(`${track.title} exceeds 180 MB browser decode limit.`);
       }
-      bytes = await track.file.arrayBuffer();
+      const bytes = await track.file.arrayBuffer();
+      buffer = await this.ctx.decodeAudioData(bytes);
     } else if (track.streamUrl) {
       const res = await fetch(track.streamUrl, { mode: 'cors', credentials: 'omit' });
       if (!res.ok) throw new Error(`Stream unavailable (HTTP ${res.status})`);
-      bytes = await res.arrayBuffer();
+      const bytes = await res.arrayBuffer();
+      buffer = await this.ctx.decodeAudioData(bytes);
+    } else if (stemBuffers) {
+      buffer = this.#sumStemBuffers(stemBuffers);
     } else {
-      throw new Error('Track has no decodable local file or CORS stream.');
+      throw new Error('Track has no decodable local file, stem bundle, or CORS stream.');
     }
 
-    const buffer = await this.ctx.decodeAudioData(bytes);
     if (buffer.duration < 10) throw new Error('Track is shorter than 10 seconds.');
 
     onProgress?.(`Analyzing beatgrid, downbeats, stems & key for ${track.title}…`);
@@ -242,12 +355,25 @@ export class ProMixerEngine {
 
     const worker = this.#ensureWorker();
     const reqId = ++this.workerReqId;
-    const analysis = await new Promise((resolve, reject) => {
+    let analysis = await new Promise((resolve, reject) => {
       this.workerPending.set(reqId, { resolve, reject });
       worker.postMessage({ id: reqId, mono, side, sampleRate: buffer.sampleRate }, transfers);
     });
 
-    const record = { buffer, analysis };
+    if (workerAnalysis) {
+      analysis = {
+        ...analysis,
+        ...workerAnalysis,
+        durationSec: analysis.durationSec,
+        heat: analysis.heat,
+        spectrum: analysis.spectrum,
+        neuralStems: Boolean(stemBuffers),
+      };
+    } else if (stemBuffers) {
+      analysis.neuralStems = true;
+    }
+
+    const record = { buffer, stemBuffers, analysis };
     this.decodedCache.set(track.id, record);
     return record;
   }
@@ -256,12 +382,15 @@ export class ProMixerEngine {
     const deck = this.decks[deckId];
     if (!deck) throw new Error(`Unknown deck ${deckId}`);
     const record = await this.decodeAndAnalyze(track);
-    const { buffer, analysis } = record;
+    const { buffer, stemBuffers, analysis } = record;
 
     await this.stopDeck(deckId);
     deck.track = track;
     deck.buffer = buffer;
+    deck.stemBuffers = stemBuffers || null;
+    deck.neuralStems = Boolean(stemBuffers && STEM_NAMES.every((s) => stemBuffers[s]));
     deck.analysis = analysis;
+    deck.strip.setNeuralMode(deck.neuralStems, this.ctx.currentTime);
 
     const entrySec = playMode === 'hooks' ? analysis.hookEntry : analysis.clubEntry;
     const exitSec =
@@ -277,12 +406,12 @@ export class ProMixerEngine {
     track.energy = analysis.energy;
     track.heat = analysis.heat;
     track.lufs = analysis.lufs;
+    track.neuralStems = deck.neuralStems;
     if (track.cueConfidence !== 'user') {
       track.entrySec = entrySec;
       track.exitSec = exitSec;
     }
 
-    // LUFS auto-gain trim toward -13 LUFS target (clamped ±6 dB)
     const lufs = Number.isFinite(analysis.lufs) ? analysis.lufs : -13;
     const trimDb = Math.max(-6, Math.min(6, -13 - lufs));
     const trimGain = Math.pow(10, trimDb / 20);
@@ -292,7 +421,21 @@ export class ProMixerEngine {
     deck.position = track.playFull ? 0 : track.entrySec;
     deck.loopActive = false;
 
-    if (deck.stretch) {
+    if (deck.neuralStems) {
+      const stMap = await this.#ensureStemStretches(deck);
+      await Promise.all(
+        STEM_NAMES.map(async (s) => {
+          const st = stMap[s];
+          const sBuf = deck.stemBuffers[s];
+          await st.dropBuffers();
+          const chans = [];
+          for (let c = 0; c < Math.min(2, sBuf.numberOfChannels); c++) {
+            chans.push(new Float32Array(sBuf.getChannelData(c)));
+          }
+          await st.addBuffers(chans);
+        })
+      );
+    } else if (deck.stretch) {
       await deck.stretch.dropBuffers();
       const chans = [];
       for (let c = 0; c < Math.min(2, buffer.numberOfChannels); c++) {
@@ -323,17 +466,34 @@ export class ProMixerEngine {
     deck.strip.deckVolume.gain.cancelScheduledValues(t);
     deck.strip.deckVolume.gain.setValueAtTime(gain, t);
 
-    if (deck.stretch) {
-      await deck.stretch.schedule({
-        output: t,
-        outputTime: t,
-        active: true,
-        input: pos,
-        rate,
-        semitones: this.masterTempoEnabled ? semitones : 0,
-        formantCompensation: true,
-        loopStart: 0,
-        loopEnd: 0,
+    const stretches = this.#getDeckStretches(deck);
+    if (stretches.length) {
+      await Promise.all(
+        stretches.map((st) =>
+          st.schedule({
+            output: t,
+            outputTime: t,
+            active: true,
+            input: pos,
+            rate,
+            semitones: this.masterTempoEnabled ? semitones : 0,
+            formantCompensation: true,
+            loopStart: 0,
+            loopEnd: 0,
+          })
+        )
+      );
+    } else if (deck.neuralStems && deck.stemBuffers) {
+      for (const src of deck.stemFallbackSources || []) {
+        try { src.stop(); } catch {}
+      }
+      deck.stemFallbackSources = STEM_NAMES.map((s) => {
+        const src = this.ctx.createBufferSource();
+        src.buffer = deck.stemBuffers[s];
+        src.playbackRate.setValueAtTime(rate, t);
+        src.connect(deck.strip.stemInputs[s]);
+        src.start(t, pos);
+        return src;
       });
     } else {
       if (deck.fallbackSource) {
@@ -355,23 +515,30 @@ export class ProMixerEngine {
     deck.loopActive = false;
     const now = this.ctx ? this.ctx.currentTime : 0;
     const t = now + 0.03;
-    if (deck.stretch) {
-      try {
-        await deck.stretch.schedule({
-          output: t,
-          outputTime: t,
-          active: false,
-          rate: 1,
-          semitones: 0,
-          loopStart: 0,
-          loopEnd: 0,
-        });
-      } catch {}
+    const stretches = this.#getDeckStretches(deck);
+    if (stretches.length) {
+      await Promise.all(
+        stretches.map((st) =>
+          st.schedule({
+            output: t,
+            outputTime: t,
+            active: false,
+            rate: 1,
+            semitones: 0,
+            loopStart: 0,
+            loopEnd: 0,
+          }).catch(() => {})
+        )
+      );
     }
     if (deck.fallbackSource) {
       try { deck.fallbackSource.stop(t); } catch {}
       deck.fallbackSource = null;
     }
+    for (const src of deck.stemFallbackSources || []) {
+      try { src.stop(t); } catch {}
+    }
+    deck.stemFallbackSources = [];
   }
 
   async pauseDeck(deckId) {
@@ -380,11 +547,18 @@ export class ProMixerEngine {
     deck.position = this.getDeckPosition(deckId);
     deck.playing = false;
     const t = this.ctx.currentTime + 0.03;
-    if (deck.stretch) {
-      await deck.stretch.schedule({ output: t, outputTime: t, active: false });
-    } else if (deck.fallbackSource) {
-      try { deck.fallbackSource.stop(); } catch {}
-      deck.fallbackSource = null;
+    const stretches = this.#getDeckStretches(deck);
+    if (stretches.length) {
+      await Promise.all(stretches.map((st) => st.schedule({ output: t, outputTime: t, active: false })));
+    } else {
+      if (deck.fallbackSource) {
+        try { deck.fallbackSource.stop(); } catch {}
+        deck.fallbackSource = null;
+      }
+      for (const src of deck.stemFallbackSources || []) {
+        try { src.stop(); } catch {}
+      }
+      deck.stemFallbackSources = [];
     }
   }
 
@@ -420,7 +594,7 @@ export class ProMixerEngine {
   getDeckPosition(deckId) {
     const deck = this.decks[deckId];
     if (!deck) return 0;
-    if (deck.stretch) return deck.position;
+    if (this.#getDeckStretches(deck).length) return deck.position;
     if (!deck.playing || !this.ctx) return deck.position;
     const elapsed = Math.max(0, this.ctx.currentTime - deck.startedAtCtx);
     return Math.min(deck.buffer?.duration || 0, deck.startedOffset + elapsed * deck.rate);
@@ -431,16 +605,19 @@ export class ProMixerEngine {
     if (!deck || !deck.playing || !deck.analysis) return false;
     const bpm = (deck.analysis.bpm || 120) * deck.rate;
     const barDur = (60 / bpm) * 4;
+    const stretches = this.#getDeckStretches(deck);
     if (deck.loopActive) {
       deck.loopActive = false;
-      if (deck.stretch) {
-        await deck.stretch.schedule({
-          output: this.ctx.currentTime + 0.03,
-          outputTime: this.ctx.currentTime + 0.03,
-          loopStart: 0,
-          loopEnd: 0,
-        });
-      }
+      await Promise.all(
+        stretches.map((st) =>
+          st.schedule({
+            output: this.ctx.currentTime + 0.03,
+            outputTime: this.ctx.currentTime + 0.03,
+            loopStart: 0,
+            loopEnd: 0,
+          })
+        )
+      );
       return false;
     }
     const pos = this.getDeckPosition(deckId);
@@ -451,14 +628,16 @@ export class ProMixerEngine {
     deck.loopActive = true;
     deck.loopStart = loopStart;
     deck.loopEnd = loopEnd;
-    if (deck.stretch) {
-      await deck.stretch.schedule({
-        output: this.ctx.currentTime + 0.03,
-        outputTime: this.ctx.currentTime + 0.03,
-        loopStart,
-        loopEnd,
-      });
-    }
+    await Promise.all(
+      stretches.map((st) =>
+        st.schedule({
+          output: this.ctx.currentTime + 0.03,
+          outputTime: this.ctx.currentTime + 0.03,
+          loopStart,
+          loopEnd,
+        })
+      )
+    );
     return true;
   }
 
@@ -644,21 +823,11 @@ export class ProMixerEngine {
     } else if (style === 'TENSION_ROLL_DROP') {
       // 4-bar beat roll tension on Deck A (loop last 1 bar -> half bar) + filter rise -> slam B
       const rollAnchor = outPos + (startAt - now) * Math.max(0.5, outDeck.rate);
-      if (outDeck.stretch) {
-        const t1 = startAt;
-        const t2 = startAt + dur * 0.5;
-        outDeck.stretch.schedule({
-          output: t1,
-          outputTime: t1,
-          loopStart: Math.max(0, rollAnchor - beatSec * 2),
-          loopEnd: Math.max(0.2, rollAnchor),
-        });
-        outDeck.stretch.schedule({
-          output: t2,
-          outputTime: t2,
-          loopStart: Math.max(0, rollAnchor - beatSec),
-          loopEnd: Math.max(0.1, rollAnchor),
-        });
+      const t1 = startAt;
+      const t2 = startAt + dur * 0.5;
+      for (const st of this.#getDeckStretches(outDeck)) {
+        st.schedule({ output: t1, outputTime: t1, loopStart: Math.max(0, rollAnchor - beatSec * 2), loopEnd: Math.max(0.2, rollAnchor) });
+        st.schedule({ output: t2, outputTime: t2, loopStart: Math.max(0, rollAnchor - beatSec), loopEnd: Math.max(0.1, rollAnchor) });
       }
       outDeck.strip.setColorFilter(0.82, startAt, dur * 0.75);
       outDeck.strip.echoSend.gain.setValueAtTime(0.1, startAt);
@@ -678,9 +847,9 @@ export class ProMixerEngine {
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
       this.echoFeedback.gain.setValueAtTime(0.5, startAt);
       this.echoFeedback.gain.setValueAtTime(0.36, endAt);
-      if (outDeck.stretch) {
-        const brakeAt = startAt + dur * 0.3;
-        outDeck.stretch.schedule({ output: brakeAt, outputTime: brakeAt, rate: 0.78, semitones: -4 });
+      const brakeAt = startAt + dur * 0.3;
+      for (const st of this.#getDeckStretches(outDeck)) {
+        st.schedule({ output: brakeAt, outputTime: brakeAt, rate: 0.78, semitones: -4 });
       }
       outGain.setValueAtTime(1.0, startAt);
       outGain.linearRampToValueAtTime(0.0001, startAt + dur * 0.65);
@@ -852,16 +1021,20 @@ export class ProMixerEngine {
         outDeck.strip.reverbSend.gain.setValueAtTime(0, startAt);
         outDeck.strip.reverbSend.gain.linearRampToValueAtTime(lvl, at + dur * 0.55);
         outDeck.strip.reverbSend.gain.linearRampToValueAtTime(0, endAt);
-      } else if (fxItem.type === 'loop_roll' && outDeck.stretch) {
+      } else if (fxItem.type === 'loop_roll') {
         const anchor = outPos + (startAt - now) * Math.max(0.5, outDeck.rate);
-        outDeck.stretch.schedule({ output: at, outputTime: at, loopStart: Math.max(0, anchor - beatSec * 2), loopEnd: Math.max(0.2, anchor) });
         const halfAt = at + dur * 0.45;
-        outDeck.stretch.schedule({ output: halfAt, outputTime: halfAt, loopStart: Math.max(0, anchor - beatSec), loopEnd: Math.max(0.1, anchor) });
-      } else if (fxItem.type === 'spinback' && outDeck.stretch) {
+        for (const st of this.#getDeckStretches(outDeck)) {
+          st.schedule({ output: at, outputTime: at, loopStart: Math.max(0, anchor - beatSec * 2), loopEnd: Math.max(0.2, anchor) });
+          st.schedule({ output: halfAt, outputTime: halfAt, loopStart: Math.max(0, anchor - beatSec), loopEnd: Math.max(0.1, anchor) });
+        }
+      } else if (fxItem.type === 'spinback') {
         const steps = 6;
-        for (let s = 0; s < steps; s++) {
-          const stAt = at + (s / steps) * 0.85;
-          outDeck.stretch.schedule({ output: stAt, outputTime: stAt, rate: 1 - (s / steps) * 0.72, semitones: -s * 2 });
+        for (const st of this.#getDeckStretches(outDeck)) {
+          for (let s = 0; s < steps; s++) {
+            const stAt = at + (s / steps) * 0.85;
+            st.schedule({ output: stAt, outputTime: stAt, rate: 1 - (s / steps) * 0.72, semitones: -s * 2 });
+          }
         }
       } else if (fxItem.type === 'riser_impact' || fxItem.type === 'impact' || fxItem.type === 'reverse_riser') {
         this.playTransitionSweepFx({ type: fxItem.type === 'reverse_riser' ? 'echo_drop' : 'sweep_cut', bpm: outBpm, durationSec: Math.min(6, dur * 0.85) });
@@ -874,14 +1047,16 @@ export class ProMixerEngine {
           outGain.setValueAtTime(1.0, stAt);
           outGain.setValueAtTime(0.05, stAt + stepSec * 0.52);
         }
-      } else if (fxItem.type === 'key_lift' && inDeck.stretch) {
+      } else if (fxItem.type === 'key_lift') {
         const liftSemi = Math.max(-2, Math.min(2, Number(fxItem.params?.semitones) || 1));
         const liftAt = startAt + dur * 0.5;
-        inDeck.stretch.schedule({ output: liftAt, outputTime: liftAt, semitones: liftSemi });
+        for (const st of this.#getDeckStretches(inDeck)) {
+          st.schedule({ output: liftAt, outputTime: liftAt, semitones: liftSemi });
+        }
       }
     }
 
-    // Apply genre-matched added_drums bridge (Dhol / House / Trap)
+    // Apply genre-matched added_drums bridge (Dhol / Tabla / House / Trap)
     if (recipe.added_drums) {
       const style = recipe.added_drums.style || 'house';
       const drGain = Math.min(0.32, Number(recipe.added_drums.gain) || 0.22);
@@ -895,11 +1070,12 @@ export class ProMixerEngine {
 
   /**
    * Per-bar drift monitor comparing AudioContext playback clock against measured downbeat grid.
-   * Applies subtle +-0.4% pitch-locked rate micro-nudges if drift exceeds 15 ms.
+   * Applies subtle +-0.4% pitch-locked rate micro-nudges across all active stem lanes if drift exceeds 15 ms.
    */
   checkDriftAndCorrect(deckId) {
     const deck = this.decks[deckId];
-    if (!deck || !deck.playing || !deck.analysis?.beat_times?.length || !this.ctx || !deck.stretch) return 0;
+    const stretches = this.#getDeckStretches(deck);
+    if (!deck || !deck.playing || !deck.analysis?.beat_times?.length || !this.ctx || !stretches.length) return 0;
     const now = this.ctx.currentTime;
     if (deck.lastDriftCheckAt && now - deck.lastDriftCheckAt < 1.8) return 0;
     deck.lastDriftCheckAt = now;
@@ -918,16 +1094,10 @@ export class ProMixerEngine {
     const driftMs = (pos - nearest) * 1000;
     if (Math.abs(driftMs) > 15 && Math.abs(driftMs) < 95) {
       const nudge = driftMs > 0 ? 0.996 : 1.004;
-      deck.stretch.schedule({
-        output: now + 0.04,
-        outputTime: now + 0.04,
-        rate: (deck.rate || 1) * nudge,
-      }).catch(() => {});
-      deck.stretch.schedule({
-        output: now + 0.44,
-        outputTime: now + 0.44,
-        rate: deck.rate || 1,
-      }).catch(() => {});
+      for (const st of stretches) {
+        st.schedule({ output: now + 0.04, outputTime: now + 0.04, rate: (deck.rate || 1) * nudge }).catch(() => {});
+        st.schedule({ output: now + 0.44, outputTime: now + 0.44, rate: deck.rate || 1 }).catch(() => {});
+      }
     }
     return Math.round(driftMs);
   }
@@ -936,79 +1106,29 @@ export class ProMixerEngine {
     const deck = this.decks[deckId];
     if (!deck?.playing) return;
     const now = this.ctx.currentTime + 0.02;
-    if (deck.stretch) {
-      for (let i = 0; i < 6; i++) {
-        const at = now + i * 0.11;
-        await deck.stretch.schedule({ output: at, outputTime: at, rate: Math.max(0.2, 1 - i * 0.16), semitones: -i * 2 });
-      }
-      const resAt = now + 0.72;
-      await deck.stretch.schedule({ output: resAt, outputTime: resAt, rate: deck.rate || 1, semitones: deck.semitones || 0 });
-    }
+    const stretches = this.#getDeckStretches(deck);
+    await Promise.all(
+      stretches.map(async (st) => {
+        for (let i = 0; i < 6; i++) {
+          const at = now + i * 0.11;
+          await st.schedule({ output: at, outputTime: at, rate: Math.max(0.2, 1 - i * 0.16), semitones: -i * 2 });
+        }
+        const resAt = now + 0.72;
+        await st.schedule({ output: resAt, outputTime: resAt, rate: deck.rate || 1, semitones: deck.semitones || 0 });
+      })
+    );
   }
 
-  #schedulePercussionBridge(when, bpm, bars, style = 'house', peakGain = 0.22) {
+  #schedulePercussionBridge(when, bpm, bars, style = 'house', peakGain = 0.24) {
     if (!this.ctx) return;
-    const sr = this.ctx.sampleRate;
-    if (!this.drumSamples) {
-      const makeBuf = (sec, fn) => {
-        const b = this.ctx.createBuffer(1, Math.floor(sr * sec), sr);
-        const d = b.getChannelData(0);
-        for (let i = 0; i < d.length; i++) d[i] = fn(i / sr);
-        return b;
-      };
-      this.drumSamples = {
-        kick: makeBuf(0.24, (t) => Math.sin(2 * Math.PI * (52 * t + 90 * (1 - Math.exp(-t * 28)) / 28)) * Math.exp(-t * 17)),
-        dholBass: makeBuf(0.28, (t) => Math.sin(2 * Math.PI * (68 * t + 75 * (1 - Math.exp(-t * 22)) / 22)) * Math.exp(-t * 12)),
-        dholRim: makeBuf(0.12, (t) => (Math.sin(2 * Math.PI * 520 * t) * 0.65 + (Math.random() * 2 - 1) * 0.35) * Math.exp(-t * 28)),
-        snare: makeBuf(0.15, (t) => ((Math.random() * 2 - 1) * 0.68 + Math.sin(2 * Math.PI * 195 * t) * 0.32) * Math.exp(-t * 22)),
-        hat: makeBuf(0.045, (t) => ((Math.random() * 2 - 1) * 0.6 + Math.sin(2 * Math.PI * 7400 * t) * 0.35) * Math.exp(-t * 82)),
-      };
-    }
-    const beat = 60 / Math.max(55, bpm);
-    const totalBeats = Math.ceil(bars * 4);
-    const hit = (buf, at, gainVal, hpFreq = 0) => {
-      const src = this.ctx.createBufferSource();
-      src.buffer = buf;
-      let node = src;
-      if (hpFreq) {
-        const f = this.ctx.createBiquadFilter();
-        f.type = 'highpass';
-        f.frequency.value = hpFreq;
-        src.connect(f);
-        node = f;
-      }
-      const g = this.ctx.createGain();
-      g.gain.setValueAtTime(0.0001, at);
-      g.gain.linearRampToValueAtTime(gainVal, at + 0.003);
-      g.gain.exponentialRampToValueAtTime(0.0001, at + buf.duration * 0.92);
-      node.connect(g);
-      g.connect(this.masterFilter);
-      src.start(at);
-      src.stop(at + buf.duration + 0.02);
-    };
-    for (let k = 0; k < totalBeats; k++) {
-      const at = when + k * beat;
-      if (style === 'dhol') {
-        // Punjabi / Bhangra swing groove (chaal triplet pulse)
-        hit(this.drumSamples.dholBass, at, k % 4 === 0 ? peakGain : peakGain * 0.65);
-        hit(this.drumSamples.dholRim, at + beat * 0.33, peakGain * 0.45);
-        hit(this.drumSamples.dholRim, at + beat * 0.66, peakGain * 0.52);
-        if (k % 2 === 1) hit(this.drumSamples.dholBass, at + beat * 0.75, peakGain * 0.55);
-      } else if (style === 'trap') {
-        if (k % 4 === 0) hit(this.drumSamples.kick, at, peakGain);
-        if (k % 4 === 1) hit(this.drumSamples.kick, at + beat * 0.5, peakGain * 0.82);
-        if (k % 4 === 2) hit(this.drumSamples.snare, at, peakGain * 0.65, 220);
-        const subdiv = k % 4 === 3 ? 6 : 4;
-        for (let s = 0; s < subdiv; s++) {
-          hit(this.drumSamples.hat, at + (s * beat) / subdiv, peakGain * 0.25, 6500);
-        }
-      } else {
-        // House 4-on-floor + offbeat hat
-        hit(this.drumSamples.kick, at, k % 4 === 0 ? peakGain : peakGain * 0.78);
-        if (k % 2 === 1) hit(this.drumSamples.snare, at, peakGain * 0.42, 260);
-        hit(this.drumSamples.hat, at + beat * 0.5, peakGain * 0.22, 6200);
-      }
-    }
+    scheduleStudioDrumBridge(this.ctx, this.masterFilter, {
+      when,
+      bpm,
+      bars,
+      style,
+      peakGain,
+      samples: this.drumSamples,
+    });
   }
 
   getSpectrumEnergy() {

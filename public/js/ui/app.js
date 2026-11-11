@@ -1,10 +1,12 @@
 import { buildFallbackHeat, NovaOrchestrator, sequenceCrate } from '/js/engine/orchestrator.js';
 import {
+  applyManualGridOverride,
   buildRecipeFromCandidate,
   normalizeSongAnalysis,
   planSetHeuristic,
   repairOrFallbackRecipe,
   scorePairCandidates,
+  validateSetPlan,
   validateTransitionRecipe,
 } from '/js/engine/dj-brain.js';
 import {
@@ -113,6 +115,9 @@ const state = {
   exportMsg: '',
   previewBusyIdx: -1,
   auditBusyIdx: -1,
+  batchAuditBusy: false,
+  planEpoch: 0,
+  tapState: { idx: -1, times: [], bpm: null, count: 0 },
   costEstimate: null,
   clickTrack: false,
   ratingsMap: (() => { try { return JSON.parse(localStorage.getItem('nova.transition.ratings.v1') || '{}'); } catch { return {}; } })(),
@@ -312,7 +317,10 @@ function refreshCostEstimate() {
 async function fetchHealth() {
   try {
     const res = await fetch('/api/health');
-    if (res.ok) state.health = await res.json();
+    if (res.ok) {
+      state.health = await res.json();
+      initOrchestrator().proMixer.workerConfigured = Boolean(state.health?.audioWorkerConfigured);
+    }
   } catch {}
   if (state.screen === 'wizard' && state.wizardStep === 0 && document.activeElement?.id !== 'input-source') {
     render();
@@ -469,20 +477,50 @@ async function handleLocalFiles(files) {
   render();
 
   const orch = initOrchestrator();
-  let count = 0;
+  // Group Demucs 4-stem file bundles (*_vocals, *_drums, *_bass, *_other) cleanly when dropped together
+  const stemGroups = new Map();
+  const soloFiles = [];
   for (const file of list) {
-    const cleanName = file.name.replace(/\.[^.]+$/, '');
+    const m = file.name.match(/^(.*?)(?:_|-|\s)(vocals|drums|bass|other)\.[^.]+$/i);
+    if (m) {
+      const base = m[1].trim() || 'Stem Track';
+      const stem = m[2].toLowerCase();
+      if (!stemGroups.has(base)) stemGroups.set(base, { raw: [], map: {} });
+      stemGroups.get(base).raw.push(file);
+      stemGroups.get(base).map[stem] = file;
+    } else {
+      soloFiles.push(file);
+    }
+  }
+
+  const fileItems = [];
+  for (const [base, grp] of stemGroups.entries()) {
+    if (['vocals', 'drums', 'bass', 'other'].every((s) => grp.map[s])) {
+      fileItems.push({ base, stemFiles: grp.map, refFile: grp.map.drums });
+    } else {
+      for (const f of grp.raw) soloFiles.push(f);
+    }
+  }
+  for (const f of soloFiles) fileItems.push({ file: f });
+
+  let count = 0;
+  for (const item of fileItems) {
+    const refFile = item.file || item.refFile;
+    const cleanName = item.stemFiles ? item.base : refFile.name.replace(/\.[^.]+$/, '');
     const parts = cleanName.split(/\s+[-–]\s+/);
     const track = {
-      id: `local-${file.name}-${file.size}-${file.lastModified}`,
+      id: item.stemFiles
+        ? `stems-${cleanName}-${refFile.size}-${refFile.lastModified}`
+        : `local-${refFile.name}-${refFile.size}-${refFile.lastModified}`,
       source: 'local',
-      provider: 'Local File · Full DSP',
+      provider: item.stemFiles ? 'Local 4-Stem Neural Bundle' : 'Local File · Full DSP',
       playback: 'web-audio-dsp',
       mixReady: true,
       dspReady: true,
+      neuralStems: Boolean(item.stemFiles),
       title: parts.length > 1 ? parts.slice(1).join(' - ') : cleanName,
-      artist: parts.length > 1 ? parts[0] : 'Local Audio',
-      file,
+      artist: parts.length > 1 ? parts[0] : (item.stemFiles ? 'Demucs Stems' : 'Local Audio'),
+      ...(item.stemFiles ? { stemFiles: item.stemFiles } : { file: item.file }),
       durationSec: 180,
       energy: 7,
       entrySec: 8,
@@ -625,6 +663,7 @@ function getLearningStats() {
 }
 
 function buildReviewSet() {
+  const reqEpoch = ++state.planEpoch;
   const ordered = sequenceCrate(state.crate, {
     vibe: state.vibe,
     playMode: state.playMode,
@@ -652,6 +691,7 @@ function buildReviewSet() {
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
+        if (reqEpoch !== state.planEpoch) return;
         if (data?.ok && data.plan?.transitions?.length) {
           state.setPlan = data.plan;
           if (Array.isArray(data.plan.order)) {
@@ -1158,7 +1198,7 @@ function renderReview() {
     return acc + playLen;
   }, 0);
 
-  const dspCount = state.sequencedSet.filter((t) => t.file || t.dspReady).length;
+  const dspCount = state.sequencedSet.filter((t) => t.file || t.stemFiles || t.stemUrls || t.dspReady).length;
   const ytCount = state.sequencedSet.length - dspCount;
 
   const right = `
@@ -1185,13 +1225,15 @@ function renderReview() {
 
       <div style="margin-top:16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
         <button id="btn-review-debug" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)">✦ INSPECT BEAT GRID &amp; RECIPES (${recipes.length})</button>
+        ${(dspCount >= 2 && recipes.length) ? `<button id="btn-review-audit-all" class="pill-btn squeeze" style="border-color:var(--accent);color:var(--accent)" ${state.batchAuditBusy ? 'disabled' : ''}>${state.batchAuditBusy ? 'AUDITING ALL…' : `🎧 AUDIT ALL (${recipes.length})`}</button>` : ''}
         ${dspCount ? `<button id="btn-review-export" class="pill-btn squeeze" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'EXPORTING…' : '⬇ EXPORT MIX (.WAV)'}</button>` : ''}
         ${state.exportMsg ? `<span style="font-size:13px;color:var(--amber)">${esc(state.exportMsg)}</span>` : ''}
       </div>
 
       <ol class="review-list" id="review-list">
         ${state.sequencedSet.map((t, idx) => {
-          const isDsp = Boolean(t.file || t.dspReady);
+          const isDsp = Boolean(t.file || t.stemFiles || t.dspReady);
+          const hasNeural = Boolean(t.neuralStems || t.analysis?.neuralStems);
           const eVal = Math.max(1, Math.min(10, Math.round(Number(t.energy) || 7)));
           const bars = Array.from({ length: 10 }, (_, b) => {
             const cls = b < eVal ? (b >= 7 ? 'energy-bar peak' : 'energy-bar on') : 'energy-bar';
@@ -1211,7 +1253,7 @@ function renderReview() {
                 <div class="row-title">${esc(t.title)}</div>
                 <div class="row-meta">
                   <span>${esc(t.artist)}</span>
-                  <span class="row-tag ${isDsp ? '' : 'yt'}">${isDsp ? 'DSP · STEMS' : 'YT DECK'}</span>
+                  <span class="row-tag ${isDsp ? '' : 'yt'}">${hasNeural ? 'NEURAL 4-STEM' : isDsp ? 'DSP · STEMS' : 'YT DECK'}</span>
                   ${t.bpm ? `<span class="font-mono-num" style="font-size:12px">${Math.round(t.bpm)} BPM</span>` : ''}
                   ${t.camelot ? `<span class="font-mono-num" style="font-size:12px;color:var(--amber)">${esc(t.camelot)}</span>` : ''}
                   ${rec ? `<span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.6)">↳ ${esc(rec.type.replace(/_/g, ' ').toUpperCase())} (${Math.round((rec.compatibility?.score || 0.7) * 100)}%)</span>` : ''}
@@ -1239,6 +1281,8 @@ function renderReview() {
       exportMsg: state.exportMsg,
       previewBusyIdx: state.previewBusyIdx,
       auditBusyIdx: state.auditBusyIdx,
+      batchAuditBusy: state.batchAuditBusy,
+      tapState: state.tapState,
       ratingsMap: state.ratingsMap,
     }) : ''}
   `;
@@ -1638,6 +1682,8 @@ function renderPlaying() {
       exportMsg: state.exportMsg,
       previewBusyIdx: state.previewBusyIdx,
       auditBusyIdx: state.auditBusyIdx,
+      batchAuditBusy: state.batchAuditBusy,
+      tapState: state.tapState,
       ratingsMap: state.ratingsMap,
     }) : ''}
   `;
@@ -1970,6 +2016,7 @@ function saveTransitionRating(rKey, val, extra = null) {
 }
 
 async function auditTransitionWithListener(idx) {
+  state.planEpoch += 1;
   const rec = state.setPlan?.transitions?.[idx];
   if (!rec) return;
   const trackA = state.sequencedSet.find((t) => t.id === rec.from);
@@ -2048,6 +2095,71 @@ async function auditTransitionWithListener(idx) {
   }
 }
 
+async function batchAuditAllTransitions() {
+  const transitions = state.setPlan?.transitions || [];
+  if (!transitions.length || state.batchAuditBusy) return;
+  state.batchAuditBusy = true;
+  state.debugModalOpen = true;
+  render();
+  let passedCount = 0;
+  for (let i = 0; i < transitions.length; i++) {
+    state.exportMsg = `Batch Auditing Transition ${i + 1}/${transitions.length}…`;
+    render();
+    await auditTransitionWithListener(i);
+    const last = state.setPlan?.transitions?.[i]?.critiqueLog?.slice(-1)[0];
+    if (last?.passed) passedCount++;
+  }
+  state.batchAuditBusy = false;
+  state.exportMsg = `Batch Audit Complete: ${passedCount}/${transitions.length} transitions passed >= 7/10 ✓`;
+  render();
+}
+
+function recalibrateTrackGrid(idx, overrideOpts) {
+  state.planEpoch += 1;
+  const analyses = state.setPlan?.analyses;
+  if (!analyses || !analyses[idx]) return;
+  const updated = applyManualGridOverride(analyses[idx], overrideOpts);
+  analyses[idx] = updated;
+
+  const seqTrack = state.sequencedSet.find((t) => t.id === updated.song_id);
+  if (seqTrack) {
+    seqTrack.bpm = updated.bpm;
+    seqTrack.entrySec = updated.clubEntry;
+    seqTrack.exitSec = updated.clubExit;
+    seqTrack.analysis = updated;
+    if (orchestrator?.proMixer?.decodedCache?.has(seqTrack.id)) {
+      const cached = orchestrator.proMixer.decodedCache.get(seqTrack.id);
+      if (cached) cached.analysis = { ...cached.analysis, ...updated };
+    }
+  }
+  saveAnalysisCache(updated.song_id, {
+    bpm: updated.bpm,
+    beat_times: updated.beat_times,
+    downbeat_times: updated.downbeat_times,
+    bars: updated.bars,
+    manualOverride: updated.manualOverride,
+  });
+
+  // Recompute adjacent transitions & run deterministic validator immediately
+  const map = {};
+  for (const a of analyses) map[a.song_id] = a;
+  for (let i = Math.max(0, idx - 1); i <= Math.min(analyses.length - 2, idx); i++) {
+    const a = analyses[i];
+    const bSong = analyses[i + 1];
+    const { candidates } = scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode, moodEnergy: state.moodEnergy });
+    let rec = buildRecipeFromCandidate(a, bSong, candidates[0]);
+    const v = validateTransitionRecipe(rec, a, bSong);
+    if (!v.valid) rec = repairOrFallbackRecipe(a, bSong, state.vibe, state.playMode);
+    rec.validation = validateTransitionRecipe(rec, a, bSong);
+    rec.candidates = candidates;
+    state.setPlan.transitions[i] = rec;
+  }
+  state.setPlan.master_bpm_curve = analyses.map((a) => ({ at_song: a.song_id, bpm: a.bpm }));
+  state.setPlan.validation = validateSetPlan(state.setPlan, map);
+  if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
+  render();
+}
+
 function bindDebugModalEvents() {
   if (!state.debugModalOpen) return;
   const backdrop = document.getElementById('debug-backdrop');
@@ -2056,6 +2168,42 @@ function bindDebugModalEvents() {
   if (closeBtn) closeBtn.onclick = () => { state.debugModalOpen = false; render(); };
   const expBtn = document.getElementById('btn-export-wav-debug');
   if (expBtn) expBtn.onclick = runOfflineWavExport;
+  const auditAllDbg = document.getElementById('btn-audit-all-debug');
+  if (auditAllDbg) auditAllDbg.onclick = batchAuditAllTransitions;
+
+  document.querySelectorAll('[data-nudge-beats]').forEach((b) => {
+    b.onclick = () => recalibrateTrackGrid(Number(b.dataset.nudgeBeats), { nudgeBeats: Number(b.dataset.delta) });
+  });
+  document.querySelectorAll('[data-nudge-ms]').forEach((b) => {
+    b.onclick = () => recalibrateTrackGrid(Number(b.dataset.nudgeMs), { nudgeMs: Number(b.dataset.delta) });
+  });
+  document.querySelectorAll('[data-grid-mult]').forEach((b) => {
+    b.onclick = () => recalibrateTrackGrid(Number(b.dataset.gridMult), { bpmMultiplier: Number(b.dataset.mult) });
+  });
+  document.querySelectorAll('[data-tap-bpm]').forEach((b) => {
+    b.onclick = () => {
+      const idx = Number(b.dataset.tapBpm);
+      const now = performance.now();
+      if (state.tapState.idx !== idx || (state.tapState.times.length && now - state.tapState.times[state.tapState.times.length - 1] > 2400)) {
+        state.tapState = { idx, times: [now], bpm: null, count: 1 };
+        render();
+        return;
+      }
+      state.tapState.times.push(now);
+      if (state.tapState.times.length > 8) state.tapState.times.shift();
+      state.tapState.count = state.tapState.times.length;
+      if (state.tapState.times.length >= 3) {
+        const diffs = [];
+        for (let i = 1; i < state.tapState.times.length; i++) diffs.push(state.tapState.times[i] - state.tapState.times[i - 1]);
+        const avgMs = diffs.reduce((x, y) => x + y, 0) / diffs.length;
+        const bpm = Math.round((60000 / Math.max(250, avgMs)) * 10) / 10;
+        state.tapState.bpm = bpm;
+        recalibrateTrackGrid(idx, { tapBpm: bpm });
+      } else {
+        render();
+      }
+    };
+  });
 
   document.querySelectorAll('[data-preview-rec]').forEach((b) => {
     b.onclick = async () => {
@@ -2151,6 +2299,8 @@ function bindReviewEvents() {
   if (openDbg) openDbg.onclick = () => { state.debugModalOpen = true; render(); };
   const revDbg = document.getElementById('btn-review-debug');
   if (revDbg) revDbg.onclick = () => { state.debugModalOpen = true; render(); };
+  const revAuditAll = document.getElementById('btn-review-audit-all');
+  if (revAuditAll) revAuditAll.onclick = batchAuditAllTransitions;
   const revExp = document.getElementById('btn-review-export');
   if (revExp) revExp.onclick = runOfflineWavExport;
   bindDebugModalEvents();

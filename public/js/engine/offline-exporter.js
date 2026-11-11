@@ -1,4 +1,28 @@
+import { loadDrumSamplesForContext, scheduleStudioDrumBridge } from './drum-pack.js';
 import { createStemChannelStrip } from './stems-isolator.js';
+
+const STEM_NAMES = ['vocals', 'drums', 'bass', 'other'];
+
+function scheduleRecordOnOfflineStrip(offline, rec, strip, { startWhen, offset, playDur, rate = 1 }) {
+  const hasNeural = rec.stemBuffers && STEM_NAMES.every((s) => rec.stemBuffers[s]);
+  if (hasNeural) {
+    strip.setNeuralMode(true, startWhen);
+    for (const stem of STEM_NAMES) {
+      const sBuf = rec.stemBuffers[stem];
+      const src = offline.createBufferSource();
+      src.buffer = sBuf;
+      src.playbackRate.setValueAtTime(rate, startWhen);
+      src.connect(strip.stemInputs[stem]);
+      src.start(startWhen, Math.min(sBuf.duration - 0.5, offset), Math.min(sBuf.duration - offset, playDur));
+    }
+    return;
+  }
+  const src = offline.createBufferSource();
+  src.buffer = rec.buffer;
+  src.playbackRate.setValueAtTime(rate, startWhen);
+  src.connect(strip.input);
+  src.start(startWhen, Math.min(rec.buffer.duration - 0.5, offset), Math.min(rec.buffer.duration - offset, playDur));
+}
 
 export function encodeWavBuffer(audioBuffer, { targetSampleRate = null, forceMono = false } = {}) {
   const srcRate = audioBuffer.sampleRate;
@@ -219,16 +243,32 @@ export async function renderTransitionClipBase64(trackA, trackB, recipe, proMixe
   stripA.lufsTrim.gain.setValueAtTime(Math.pow(10, Math.max(-6, Math.min(6, -13 - (recA.analysis.lufs || -13))) / 20), 0);
   stripB.lufsTrim.gain.setValueAtTime(Math.pow(10, Math.max(-6, Math.min(6, -13 - (recB.analysis.lufs || -13))) / 20), 0);
 
-  const srcA = offline.createBufferSource();
-  srcA.buffer = recA.buffer;
-  srcA.connect(stripA.input);
-  srcA.start(0, Math.min(recA.buffer.duration - 2, aOffset), Math.min(recA.buffer.duration - aOffset, preRollSec + overlapSec));
+  scheduleRecordOnOfflineStrip(offline, recA, stripA, {
+    startWhen: 0,
+    offset: Math.min(recA.buffer.duration - 2, aOffset),
+    playDur: preRollSec + overlapSec,
+    rate: 1,
+  });
+  scheduleRecordOnOfflineStrip(offline, recB, stripB, {
+    startWhen: preRollSec,
+    offset: Math.min(recB.buffer.duration - 2, bOffset),
+    playDur: (overlapSec + postRollSec) * bRate,
+    rate: bRate,
+  });
 
-  const srcB = offline.createBufferSource();
-  srcB.buffer = recB.buffer;
-  srcB.playbackRate.setValueAtTime(bRate, preRollSec);
-  srcB.connect(stripB.input);
-  srcB.start(preRollSec, Math.min(recB.buffer.duration - 2, bOffset), Math.min(recB.buffer.duration - bOffset, (overlapSec + postRollSec) * bRate));
+  if (recipe.added_drums) {
+    const samples = await loadDrumSamplesForContext(offline).catch(() => null);
+    if (samples) {
+      scheduleStudioDrumBridge(offline, masterCeiling, {
+        when: preRollSec,
+        bpm: recA.analysis.bpm || 120,
+        bars: Math.max(2, lenBars),
+        style: recipe.added_drums.style || 'house',
+        peakGain: Math.min(0.28, Number(recipe.added_drums.gain) || 0.22),
+        samples,
+      });
+    }
+  }
 
   const barUnit = overlapSec / lenBars;
   stripA.deckVolume.gain.setValueAtTime(1, 0);
@@ -262,7 +302,7 @@ export async function renderTransitionClipBase64(trackA, trackB, recipe, proMixe
  * Renders the full set + Phase 2/3 recipes offline via OfflineAudioContext into a downloadable .WAV mix.
  */
 export async function exportMixToWav(tracks, recipes, proMixer, { title = 'NOVA-DJ-Mix', onProgress } = {}) {
-  const dspTracks = tracks.filter((t) => t.file || (t.dspReady && t.streamUrl));
+  const dspTracks = tracks.filter((t) => t.file || t.stemFiles || t.stemUrls || (t.dspReady && t.streamUrl));
   if (!dspTracks.length) {
     throw new Error('Offline WAV export requires local audio files or Audius Full-DSP tracks (YouTube iframes cannot be rendered offline).');
   }
@@ -271,7 +311,7 @@ export async function exportMixToWav(tracks, recipes, proMixer, { title = 'NOVA-
   const records = [];
   for (const t of dspTracks) {
     const rec = await proMixer.decodeAndAnalyze(t);
-    records.push({ track: t, buffer: rec.buffer, analysis: rec.analysis });
+    records.push({ track: t, buffer: rec.buffer, stemBuffers: rec.stemBuffers || null, analysis: rec.analysis });
   }
 
   const sampleRate = records[0].buffer.sampleRate || 44100;
@@ -329,6 +369,8 @@ export async function exportMixToWav(tracks, recipes, proMixer, { title = 'NOVA-
   masterCeiling.connect(masterComp);
   masterComp.connect(offline.destination);
 
+  const offlineDrumSamples = await loadDrumSamplesForContext(offline).catch(() => null);
+
   for (let i = 0; i < timeline.length; i++) {
     const item = timeline[i];
     const strip = createStemChannelStrip(offline, masterCeiling);
@@ -336,11 +378,12 @@ export async function exportMixToWav(tracks, recipes, proMixer, { title = 'NOVA-
     const trimDb = Math.max(-6, Math.min(6, -13 - lufs));
     strip.lufsTrim.gain.setValueAtTime(Math.pow(10, trimDb / 20), item.startCtx);
 
-    const src = offline.createBufferSource();
-    src.buffer = item.buffer;
-    src.playbackRate.setValueAtTime(item.rate, item.startCtx);
-    src.connect(strip.input);
-    src.start(item.startCtx, item.inOffset, item.playDur);
+    scheduleRecordOnOfflineStrip(offline, item, strip, {
+      startWhen: item.startCtx,
+      offset: item.inOffset,
+      playDur: item.playDur,
+      rate: item.rate,
+    });
 
     if (item.prevRec) {
       const ov = timeline[i - 1].overlapSec || 8;
@@ -371,6 +414,16 @@ export async function exportMixToWav(tracks, recipes, proMixer, { title = 'NOVA-
       }
       for (const layer of (item.nextRec.stem_layers || []).filter((s) => s.song === item.track.id && s.stem !== 'all')) {
         for (const [b, g] of layer.gain_curve || []) strip.setStem(layer.stem, g, outStart + b * barUnit, 0.04);
+      }
+      if (item.nextRec.added_drums && offlineDrumSamples) {
+        scheduleStudioDrumBridge(offline, masterCeiling, {
+          when: outStart,
+          bpm: item.analysis.bpm || 120,
+          bars: Math.max(2, Number(item.nextRec.length_bars) || 8),
+          style: item.nextRec.added_drums.style || 'house',
+          peakGain: Math.min(0.28, Number(item.nextRec.added_drums.gain) || 0.22),
+          samples: offlineDrumSamples,
+        });
       }
     } else {
       strip.deckVolume.gain.setValueAtTime(1.0, Math.max(item.startCtx, item.startCtx + item.realDur - 2.5));

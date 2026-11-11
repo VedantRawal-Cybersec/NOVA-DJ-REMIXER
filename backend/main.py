@@ -18,10 +18,19 @@ app.add_middleware(
 )
 
 
+import base64
+
+
 class AnalyzeUrlBody(BaseModel):
     url: str
     song_id: Optional[str] = None
     filename: Optional[str] = "stream.mp3"
+
+
+class AnalyzeB64Body(BaseModel):
+    audioBase64: str
+    song_id: Optional[str] = None
+    filename: Optional[str] = "upload.wav"
 
 
 @app.get("/health")
@@ -55,6 +64,17 @@ def analyze_url(body: AnalyzeUrlBody):
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = resp.read()
     return analyze_audio_file(raw, body.filename or "stream.mp3", song_id=body.song_id)
+
+
+@app.post("/analyze-b64")
+def analyze_b64(body: AnalyzeB64Body):
+    try:
+        raw = base64.b64decode(body.audioBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio payload")
+    if len(raw) < 1024:
+        raise HTTPException(status_code=400, detail="Audio file too small")
+    return analyze_audio_file(raw, body.filename or "upload.wav", song_id=body.song_id)
 
 
 @app.get("/stems/{song_hash}/{stem_name}")

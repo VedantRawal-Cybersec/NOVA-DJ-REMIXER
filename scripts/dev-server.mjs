@@ -17,6 +17,7 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
+  '.wav': 'audio/wav',
   '.wasm': 'application/wasm',
 };
 
