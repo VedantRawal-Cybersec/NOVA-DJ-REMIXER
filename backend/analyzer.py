@@ -70,77 +70,137 @@ def _detect_key_camelot(y: np.ndarray, sr: int) -> Tuple[str, str, float]:
 
 
 def _track_beats_and_downbeats(y: np.ndarray, sr: int, duration: float) -> Tuple[float, float, List[float], List[float], Dict[str, Any]]:
-    """Multi-tracker beat/downbeat tracking: beat_this -> madmom -> librosa fallback."""
-    beats: List[float] = []
-    downbeats: List[float] = []
-    bpm = 120.0
-    conf = 0.65
-    tracker = "librosa"
+    """Dual-method beat/downbeat tracking: compares beat_this/madmom/librosa_dp vs tempogram PLP and resolves octaves."""
+    candidates: List[Dict[str, Any]] = []
 
-    # 1. Try beat_this if installed
+    # Method A (neural): beat_this or madmom if available
     try:
         from beat_this.inference import Audio2Beats  # type: ignore
         a2b = Audio2Beats()
         b_times, db_times = a2b(y, sr)
         if len(b_times) >= 8:
-            beats = [round(float(t), 3) for t in b_times]
-            downbeats = [round(float(t), 3) for t in db_times if t is not None]
-            tracker = "beat_this"
-            conf = 0.9
+            b_list = [round(float(t), 3) for t in b_times]
+            ibis = np.diff(b_list)
+            ibis = ibis[(ibis > 0.25) & (ibis < 1.35)]
+            b_bpm = float(60.0 / np.median(ibis)) if len(ibis) else 120.0
+            candidates.append({
+                "name": "beat_this",
+                "bpm": b_bpm,
+                "conf": 0.9,
+                "beats": b_list,
+                "downbeats": [round(float(t), 3) for t in db_times if t is not None],
+            })
     except Exception:
         pass
 
-    # 2. Try madmom RNNDownBeatProcessor if beats not yet found
-    if not beats:
+    if not candidates:
         try:
             import madmom  # type: ignore
             proc = madmom.features.downbeats.DBNDownBeatTrackingProcessor(beats_per_bar=[4], fps=100)
             act = madmom.features.downbeats.RNNDownBeatProcessor()(y)
             res = proc(act)
             if len(res) >= 8:
-                beats = [round(float(r[0]), 3) for r in res]
-                downbeats = [round(float(r[0]), 3) for r in res if int(r[1]) == 1]
-                tracker = "madmom"
-                conf = 0.88
+                b_list = [round(float(r[0]), 3) for r in res]
+                ibis = np.diff(b_list)
+                ibis = ibis[(ibis > 0.25) & (ibis < 1.35)]
+                b_bpm = float(60.0 / np.median(ibis)) if len(ibis) else 120.0
+                candidates.append({
+                    "name": "madmom",
+                    "bpm": b_bpm,
+                    "conf": 0.88,
+                    "beats": b_list,
+                    "downbeats": [round(float(r[0]), 3) for r in res if int(r[1]) == 1],
+                })
         except Exception:
             pass
 
-    # 3. Librosa beat_track reliable baseline
-    if not beats:
-        import librosa
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-        bpm = float(np.atleast_1d(tempo)[0])
-        beats = [round(float(t), 3) for t in librosa.frames_to_time(beat_frames, sr=sr)]
-        # Estimate Bar 1 phase from onset low-band weights
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, fmax=150)
-        phase_scores = [0.0, 0.0, 0.0, 0.0]
-        for idx, bf in enumerate(beat_frames):
-            if 0 <= bf < len(onset_env):
-                phase_scores[idx % 4] += float(onset_env[bf])
-        phase = int(np.argmax(phase_scores))
-        downbeats = [beats[i] for i in range(phase, len(beats), 4)]
-        conf = 0.78 if len(beats) >= 12 else 0.3
+    # Method B: Librosa DP beat_track
+    import librosa
+    onset_low = librosa.onset.onset_strength(y=y, sr=sr, fmax=180)
+    onset_full = librosa.onset.onset_strength(y=y, sr=sr)
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, onset_envelope=onset_full, trim=False)
+    bpm_lib = float(np.atleast_1d(tempo)[0])
+    beats_lib = [round(float(t), 3) for t in librosa.frames_to_time(beat_frames, sr=sr)]
+    phase_scores = [0.0, 0.0, 0.0, 0.0]
+    for idx, bf in enumerate(beat_frames):
+        if 0 <= bf < len(onset_low):
+            phase_scores[idx % 4] += float(onset_low[bf])
+    phase = int(np.argmax(phase_scores))
+    downbeats_lib = [beats_lib[i] for i in range(phase, len(beats_lib), 4)]
+    candidates.append({
+        "name": "librosa_beat_track",
+        "bpm": bpm_lib,
+        "conf": 0.78 if len(beats_lib) >= 12 else 0.3,
+        "beats": beats_lib,
+        "downbeats": downbeats_lib,
+    })
+
+    # Method C: Librosa Predominant Local Pulse (PLP) second independent tracker when < 2 candidates
+    if len(candidates) < 2:
+        try:
+            pulse = librosa.beat.plp(onset_envelope=onset_full, sr=sr, tempo_min=60, tempo_max=190)
+            plp_frames = librosa.util.peak_pick(pulse, pre_max=4, post_max=4, pre_avg=5, post_avg=5, delta=0.08, wait=6)
+            beats_plp = [round(float(t), 3) for t in librosa.frames_to_time(plp_frames, sr=sr)]
+            ibis_p = np.diff(beats_plp)
+            ibis_p = ibis_p[(ibis_p > 0.25) & (ibis_p < 1.35)]
+            bpm_plp = float(60.0 / np.median(ibis_p)) if len(ibis_p) else bpm_lib
+            candidates.append({
+                "name": "librosa_plp",
+                "bpm": bpm_plp,
+                "conf": 0.74 if len(beats_plp) >= 12 else 0.3,
+                "beats": beats_plp,
+                "downbeats": beats_plp[::4],
+            })
+        except Exception:
+            pass
+
+    primary = candidates[0]
+    secondary = candidates[1] if len(candidates) > 1 else candidates[0]
+    bpm = primary["bpm"]
+    conf = primary["conf"]
+    beats = primary["beats"]
+    downbeats = primary["downbeats"]
+    tracker = primary["name"]
 
     if len(beats) >= 4:
         ibis = np.diff(beats)
-        ibis = ibis[(ibis > 0.25) & (ibis < 1.25)]
+        ibis = ibis[(ibis > 0.24) & (ibis < 1.35)]
         if len(ibis):
             bpm = round(float(60.0 / np.median(ibis)), 2)
 
     if not downbeats and beats:
         downbeats = beats[::4]
 
-    # Measure tempo stability / drift across quartiles
+    # Compare primary vs secondary across octave ratios (1x, 2x, 0.5x)
+    min_err = min(abs(bpm * k - secondary["bpm"]) / max(55.0, bpm * k, secondary["bpm"]) for k in (1.0, 2.0, 0.5))
+    octave_resolved = min_err <= 0.05 and abs(bpm - secondary["bpm"]) / max(55.0, bpm) > 0.05
+
     drift_pct = 0.0
+    ibi_cv = 0.0
     if len(beats) >= 12:
         ibis = np.diff(beats)
-        ibis = ibis[(ibis > 0.25) & (ibis < 1.25)]
+        ibis = ibis[(ibis > 0.24) & (ibis < 1.35)]
         if len(ibis) >= 8:
             q1 = float(np.mean(ibis[: len(ibis) // 3]))
             q3 = float(np.mean(ibis[-len(ibis) // 3 :]))
             drift_pct = round(abs(q3 - q1) / max(0.2, q1) * 100.0, 2)
+            ibi_cv = round(float(np.std(ibis) / max(0.2, np.mean(ibis))), 4)
 
-    return bpm, conf, beats, downbeats, {"tracker": tracker, "drift_pct": drift_pct, "is_variable": drift_pct > 3.5}
+    low_confidence = min_err > 0.07 or conf < 0.45 or drift_pct > 5.0 or ibi_cv > 0.11
+    return bpm, conf, beats, downbeats, {
+        "tracker": tracker,
+        "drift_pct": drift_pct,
+        "ibi_cv": ibi_cv,
+        "is_variable": drift_pct > 3.5,
+        "low_confidence": low_confidence,
+        "comparison": {
+            "method_a": {"name": primary["name"], "bpm": round(primary["bpm"], 1), "conf": primary["conf"]},
+            "method_b": {"name": secondary["name"], "bpm": round(secondary["bpm"], 1), "conf": secondary["conf"]},
+            "chosen": tracker,
+            "bpm_delta_pct": round(min_err * 100.0, 1),
+            "octave_resolved": octave_resolved,
+        },
+    }
 
 
 def _separate_stems_demucs(audio_path: Path, out_dir: Path) -> Optional[Dict[str, Path]]:
@@ -320,10 +380,14 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
         warnings.append("no_clear_beat")
     if stab["is_variable"]:
         warnings.append("variable_tempo")
+    if stab.get("low_confidence"):
+        warnings.append("low_confidence")
+    safe_only = bool(stab.get("low_confidence") or "no_clear_beat" in warnings)
 
     result = {
         "song_id": song_id or h,
         "hash": h,
+        "content_hash": h,
         "title": Path(filename).stem,
         "duration_sec": round(duration, 2),
         "lufs": measured_lufs,
@@ -331,6 +395,11 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "track.wav", song_id:
         "bpm_confidence": bpm_conf,
         "beat_times": beats,
         "downbeat_times": downbeats,
+        "tracker_comparison": stab.get("comparison"),
+        "low_confidence": safe_only,
+        "safe_transitions_only": safe_only,
+        "stems_available": bool(stems_map),
+        "stem_mode": "demucs-4stem" if stems_map else "eq-midside-off",
         "bar_count": bar_count,
         "bars": bars,
         "phrase_boundaries": phrase_boundaries,

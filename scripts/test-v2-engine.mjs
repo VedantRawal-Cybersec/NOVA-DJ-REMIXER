@@ -121,4 +121,33 @@ const explicitTap = applyManualGridOverride(songB, { tapBpm: 128.5 });
 assert.equal(explicitTap.bpm, 128.5);
 assert.equal(explicitTap.bpm_confidence, 0.96);
 
-console.log('ALL V2 BRAIN, CREATIVITY & VALIDATOR UNIT TESTS PASSED ✓');
+// 6. Phase 3 Strict Validator Rules: mid-phrase mix-in, late last-seconds exit, low_confidence safe-only, all 13 core types
+const REQUIRED_13 = [
+  'bass_swap_blend', 'long_blend', 'filter_sweep', 'echo_out', 'reverb_wash',
+  'drum_loop_bridge', 'loop_roll_drop', 'build_up_drop', 'vocal_mashup',
+  'acapella_in', 'instrumental_in', 'half_time_switch', 'impact_cut',
+];
+for (const reqT of REQUIRED_13) {
+  assert.ok(TRANSITION_TYPES.includes(reqT), `Missing required transition type: ${reqT}`);
+}
+
+const badMidPhraseIn = buildRecipeFromCandidate(songA, songB, candidates[0], 'bass_swap_blend');
+badMidPhraseIn.mix_in_bar = 3;
+assert.equal(validateTransitionRecipe(badMidPhraseIn, songA, songB).valid, false, 'Must reject mid-phrase mix_in_bar=3!');
+
+const badLateOut = buildRecipeFromCandidate(songA, songB, candidates[0], 'bass_swap_blend');
+badLateOut.mix_out_bar = songA.bar_count - 8;
+badLateOut.length_bars = 8;
+assert.equal(validateTransitionRecipe(badLateOut, songA, songB).valid, false, 'Must reject leaving in final 8 bars!');
+
+const lowConfSong = normalizeSongAnalysis({
+  id: 'lowc', title: 'Drifting Live', bpm: 112, duration_sec: 150,
+  safe_transitions_only: true, warnings: ['low_confidence'],
+});
+const badLowConf = buildRecipeFromCandidate(lowConfSong, songB, { mix_out_bar: 32, mix_in_bar: 0, length_bars: 16, pitch_shift_semitones: 0, bpm_diff_pct: 5, score: 0.6 }, 'vocal_mashup');
+assert.equal(validateTransitionRecipe(badLowConf, lowConfSong, songB).valid, false, 'Must reject layered mashup on safe_transitions_only track!');
+
+const { candidates: repairedCheck } = scorePairCandidates(songA, songB, { arc: 'peak', playMode: 'club' });
+assert.ok(songA.bar_count - repairedCheck[0].mix_out_bar >= 16, `mix_out_bar ${repairedCheck[0].mix_out_bar} should leave >= 16 bars before end (bar_count=${songA.bar_count})`);
+
+console.log('ALL V2/V3 BRAIN, CREATIVITY & STRICT VALIDATOR UNIT TESTS PASSED ✓');

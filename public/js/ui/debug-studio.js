@@ -60,11 +60,27 @@ function renderSongGridSvg(analysis, mixOutBar = null, mixInBar = null) {
     return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(W / heat.length * 0.7).toFixed(1)}" height="${bh.toFixed(1)}" rx="1.5" fill="rgba(245,245,240,0.52)" />`;
   }).join('');
 
+  const beatTimes = analysis.beat_times || [];
+  const beatStep = Math.max(1, Math.floor(beatTimes.length / 160));
+  const beatTicks = beatTimes.filter((_, idx) => idx % beatStep === 0).map((t) => {
+    const x = (t / dur) * W;
+    return `<line x1="${x.toFixed(1)}" y1="${H - 18}" x2="${x.toFixed(1)}" y2="${H - 8}" stroke="rgba(120,220,255,0.58)" stroke-width="1" />`;
+  }).join('');
+
   const dbs = analysis.downbeat_times || [];
   const step = Math.max(1, Math.floor(dbs.length / 48));
   const dbLines = dbs.filter((_, idx) => idx % step === 0).map((t) => {
     const x = (t / dur) * W;
-    return `<line x1="${x.toFixed(1)}" y1="20" x2="${x.toFixed(1)}" y2="${H - 8}" stroke="rgba(255,77,0,0.45)" stroke-width="1" />`;
+    return `<line x1="${x.toFixed(1)}" y1="20" x2="${x.toFixed(1)}" y2="${H - 8}" stroke="rgba(255,77,0,0.52)" stroke-width="1.2" />`;
+  }).join('');
+
+  const lyricMarkers = (analysis.lyrics || []).slice(0, 16).map((l) => {
+    const x = Math.max(0, Math.min(W - 4, ((Number(l.start_sec) || 0) / dur) * W));
+    const snippet = escHtml(String(l.text || '').slice(0, 14));
+    return `<g>
+      <circle cx="${x.toFixed(1)}" cy="86" r="2.2" fill="#9effa6" />
+      <text x="${Math.min(W - 56, x + 4).toFixed(1)}" y="89" fill="rgba(158,255,166,0.8)" font-size="7.5" font-family="monospace">${snippet}</text>
+    </g>`;
   }).join('');
 
   let markerSvg = '';
@@ -79,8 +95,8 @@ function renderSongGridSvg(analysis, mixOutBar = null, mixInBar = null) {
       <text x="${Math.min(W - 55, x + 3).toFixed(1)}" y="30" fill="#ffb800" font-size="10" font-weight="bold" font-family="monospace">IN B${mixInBar}</text>`;
   }
 
-  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:76px;display:block;border-radius:10px;background:rgba(255,255,255,0.03);border:1px solid rgba(245,245,240,0.1)">
-    ${secRects}${protectedRects}${bars}${dbLines}${gapRects}${markerSvg}
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:84px;display:block;border-radius:10px;background:rgba(255,255,255,0.03);border:1px solid rgba(245,245,240,0.1)">
+    ${secRects}${protectedRects}${bars}${beatTicks}${dbLines}${lyricMarkers}${gapRects}${markerSvg}
   </svg>`;
 }
 
@@ -174,11 +190,12 @@ export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg
 
                     ${log.length ? `
                       <div style="margin-top:10px;padding:10px 12px;border-radius:12px;background:rgba(255,184,0,0.06);border:1px solid rgba(255,184,0,0.25);font-size:12px">
-                        <div class="font-mono-num" style="color:var(--amber);margin-bottom:4px">RENDER → LISTEN → CRITIQUE LOG (${log.length} ITERATION${log.length > 1 ? 'S' : ''})</div>
+                        <div class="font-mono-num" style="color:var(--amber);margin-bottom:4px">DJUSTIFY RENDER → CHECK (9 GATES) → CRITIQUE LOG (${log.length} ITERATION${log.length > 1 ? 'S' : ''})</div>
                         ${log.map((item) => `
                           <div style="margin-top:4px;color:rgba(245,245,240,0.8)">
                             <strong>#${item.iteration}: ${item.passed ? '✓ PASSED' : '↻ REVISED'} (${item.score}/10)</strong>
-                            · Bass Overlap ${item.metrics?.bass_overlap_pct ?? 0}% · Drift ${item.metrics?.beat_drift_ms ?? 0}ms · LUFS Δ ${item.metrics?.lufs_jump_db ?? 0}dB · Clip ${item.metrics?.clipping_samples ?? 0}
+                            · Bass Overlap ${item.metrics?.bass_overlap_pct ?? 0}% · Drift ${item.metrics?.beat_drift_ms ?? 0}ms · LUFS Δ ${item.metrics?.lufs_jump_db ?? 0}dB · Energy Hole ${item.metrics?.energy_hole_pct ?? 0}% · Clip ${item.metrics?.clipping_samples ?? 0}
+                            ${item.checkerGates ? `<span class="row-tag" style="font-size:9px;margin-left:4px;background:${item.checkerGates.passed ? 'rgba(107,255,149,0.15)' : 'rgba(255,107,107,0.15)'};color:${item.checkerGates.passed ? '#6bff95' : '#ff6b6b'}">GATES: ${item.checkerGates.passed_count}/${item.checkerGates.total_gates}</span>` : ''}
                             <div style="opacity:0.75">${escHtml(item.notes || '')}</div>
                           </div>
                         `).join('')}
@@ -207,22 +224,32 @@ export function renderDebugModal({ plan, tracks, opusBusy, exportBusy, exportMsg
                 const lu = a.lyric_understanding || {};
                 const protCount = lu.do_not_cut_ranges?.length || 0;
                 const isTapHere = tapState?.idx === idx && tapState.count > 0;
+                const tc = a.tracker_comparison || null;
+                const hasStems = Boolean(a.stems_available || a.neuralStems);
+                const lowConf = Boolean(a.low_confidence || a.safe_transitions_only || (a.warnings || []).includes('low_confidence'));
                 return `
-                  <div style="border:1px solid rgba(245,245,240,0.12);border-radius:14px;padding:12px">
+                  <div style="border:1px solid ${lowConf ? 'rgba(255,90,90,0.45)' : 'rgba(245,245,240,0.12)'};border-radius:14px;padding:12px">
                     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-bottom:8px">
                       <span style="font-weight:600">${idx + 1}. ${escHtml(a.title)} <span style="opacity:0.55">· ${escHtml(a.artist)}</span></span>
                       <span class="font-mono-num" style="font-size:12px;color:var(--amber)">
-                        ${a.bpm} BPM · ${a.key_camelot || 'NO KEY'} · ${a.bar_count} BARS · ${a.instrumental_gaps?.length || 0} GAPS
-                        ${a.neuralStems ? ' · NEURAL 4-STEM ✓' : ''}
+                        ${a.bpm} BPM (${Math.round((a.bpm_confidence || 0.7) * 100)}%) · ${a.key_camelot || 'NO KEY'} · ${a.bar_count} BARS · ${a.beat_times?.length || 0} BEATS · ${a.instrumental_gaps?.length || 0} GAPS
+                        · ${hasStems ? '<span style="color:#6bff95">STEMS: DEMUCS 4-LANE ✓</span>' : '<span style="color:rgba(245,245,240,0.58)">STEMS: OFF (EQ ISOLATOR)</span>'}
+                        ${a.content_hash ? ` · ${a.cached ? 'CACHED ✓' : 'HASH'} ${escHtml(String(a.content_hash).slice(0, 8))}` : ''}
                         ${lu.language ? ` · ${escHtml(String(lu.language).toUpperCase())}` : ''}
                         ${protCount ? ` · 🛡 ${protCount} PROTECTED` : ''}
-                        ${lu.explicit_flag ? ' · EXPLICIT' : ''}
-                        ${a.warnings?.length ? ` · ⚠ ${escHtml(a.warnings.join(', '))}` : ''}
+                        ${lowConf ? ' · <span style="color:#ff7b7b">⚠ LOW CONFIDENCE · SAFE-TRANSITIONS ONLY</span>' : (a.warnings?.length ? ` · ⚠ ${escHtml(a.warnings.join(', '))}` : '')}
                       </span>
                     </div>
+                    ${tc ? `
+                      <div class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.55);margin-bottom:6px">
+                        DUAL TRACKER: ${tc.method_a ? `${escHtml(tc.method_a.name)} ${tc.method_a.bpm} BPM` : 'Essentia N/A'} vs ${tc.method_b ? `${escHtml(tc.method_b.name)} ${tc.method_b.bpm} BPM` : ''}
+                        · Chosen: ${escHtml(tc.chosen || '')} · Agreement: ${tc.agreement_pct ?? 100}%${tc.octave_resolved ? ' (2×/½× OCTAVE RESOLVED)' : ''}
+                      </div>
+                    ` : ''}
                     ${renderSongGridSvg(a, outRec?.mix_out_bar ?? null, inRec?.mix_in_bar ?? null)}
                     <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
                       <span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.48)">BEAT-1 CALIBRATE:</span>
+                      <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px;border-color:rgba(120,220,255,0.45);color:#78dcff" data-click-check="${idx}">▶ CLICK CHECK</button>
                       <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-beats="${idx}" data-delta="-1">◀ -1 BEAT</button>
                       <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-beats="${idx}" data-delta="1">+1 BEAT ▶</button>
                       <button class="pill-btn squeeze" style="font-size:11px;padding:2px 8px" data-nudge-ms="${idx}" data-delta="-20">◀ -20ms</button>

@@ -3,6 +3,7 @@ import { getAiHealth, invokeAiRole } from './_lib/llm-router.js';
 import {
   GENRE_PLAYBOOKS,
   TRANSITION_TYPES,
+  evaluateCheckerGates,
   normalizeSongAnalysis,
   repairOrFallbackRecipe,
   validateTransitionRecipe,
@@ -262,21 +263,35 @@ Listen to the audio clip carefully and output STRICT VALID JSON ONLY:
       };
     }
 
-    const metricsBad = (Number(metrics.clipping_samples) || 0) > 0 || (Number(metrics.bass_overlap_pct) || 0) > 34 || (Number(metrics.beat_drift_ms) || 0) > 45;
-    const score = Number(listener.score_1_to_10) || 7;
-    const passed = score >= 7 && !metricsBad;
+    // Step 2: Deterministic 9-gate acoustic checker (DJustify & Vande Veire verification)
+    const gateCheck = evaluateCheckerGates(metrics, recipe, a, b);
 
-    // Step 2: Critic proposes revised recipe only when listener score < 7 or metrics fail
+    const metricsBad =
+      (Number(metrics.clipping_samples) || 0) > 0 ||
+      (Number(metrics.bass_overlap_pct) || 0) > 32 ||
+      (Number(metrics.vocal_overlap_pct) || 0) > 38 ||
+      (Number(metrics.energy_hole_pct) || 0) > 24 ||
+      Math.abs(Number(metrics.lufs_jump_db) || 0) > 6.5 ||
+      (Number(metrics.beat_drift_ms) || 0) > 28;
+    const score = Number(listener.score_1_to_10) || (gateCheck.passed ? 8 : 5.5);
+    const passed = score >= 7 && !metricsBad && gateCheck.passed;
+
+    // Step 3: Critic proposes revised recipe when listener score < 7 or any checker gate fails (up to 4 iterations)
     let revisedRecipe = null;
     let criticProvider = null;
-    if (!passed && iteration < 3) {
+    if (!passed && iteration <= 4) {
       const criticRes = await invokeAiRole({
         role: 'CRITIC',
         req,
-        userPrompt: `You are NOVA's Mix Critic. The Audio Listener and DSP checker flagged issues in this transition recipe.
+        temperature: 0.6,
+        userPrompt: `You are NOVA's Mix Critic (DJustify & Vande Veire deterministic audio checker engine).
+The Audio Listener and 9 deterministic acoustic checker gates flagged issues in this transition recipe.
 Current recipe: ${JSON.stringify(recipe)}
 Metrics: ${JSON.stringify(metrics)}
-Listener report: ${JSON.stringify(listener)}
+Checker gates report: ${JSON.stringify(gateCheck)}
+Specific repair instructions:
+${gateCheck.repair_instructions.join('\n') || 'Tighten overlap, ensure single bassline low <= -24dB, eliminate vocal collision, and prevent energy hole.'}
+Listener notes: ${listener.notes || ''}
 Genre playbooks: ${JSON.stringify({ A: GENRE_PLAYBOOKS[a.genreKey], B: GENRE_PLAYBOOKS[b.genreKey] })}
 Allowed types: ${TRANSITION_TYPES.join(', ')}
 
@@ -306,7 +321,7 @@ Ensure only ONE bassline plays at a time (deck low <= -24dB during handover), ze
             gain_curve: (sl.gain_curve || []).map(([bar, g]) => [bar, Math.round(g * 0.82 * 100) / 100]),
           }));
         }
-        revisedRecipe.why = `Auto-repaired after critique (${(listener.issues || []).join('; ') || 'tighter bass/vocal separation & -1.5dB headroom'}).`;
+        revisedRecipe.why = `Auto-repaired after critique (${(gateCheck.failed_gates || []).map((g) => g.label).join('; ') || (listener.issues || []).join('; ') || 'single-bass/single-treble & -1.5dB headroom'}).`;
         criticProvider = 'deterministic-critic';
       }
     }
@@ -316,6 +331,7 @@ Ensure only ONE bassline plays at a time (deck low <= -24dB during handover), ze
       iteration,
       passed,
       listener,
+      checkerGates: gateCheck,
       criticUsed: Boolean(revisedRecipe),
       criticProvider,
       revisedRecipe,

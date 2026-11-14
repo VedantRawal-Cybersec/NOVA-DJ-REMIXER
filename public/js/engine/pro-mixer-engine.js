@@ -1,4 +1,10 @@
 import { getHarmonicMatch } from './camelot.js';
+import {
+  computeAudioBufferHash,
+  computeAudioContentHash,
+  getCachedAnalysisByHash,
+  saveCachedAnalysisByHash,
+} from './analysis-cache.js';
 import { loadDrumSamplesForContext, scheduleStudioDrumBridge } from './drum-pack.js';
 import { createStemChannelStrip } from './stems-isolator.js';
 
@@ -26,10 +32,14 @@ export class ProMixerEngine {
     this.ctx = null;
     this.masterGain = null;
     this.compressor = null;
+    this.limiter = null;
     this.analyser = null;
     this.recordDest = null;
     this.recorder = null;
     this.recordChunks = [];
+    this.clockWorkletNode = null;
+    this.clockListeners = new Set();
+    this.clockMode = 'uninitialized';
 
     // Master FX buses
     this.masterFilter = null;
@@ -57,6 +67,8 @@ export class ProMixerEngine {
     this.masterBpm = 120;
     this.recorderActive = false;
     this.freqData = null;
+    this.scheduledEvents = [];
+    this._eventSeq = 1;
   }
 
   async ensureContext() {
@@ -73,13 +85,20 @@ export class ProMixerEngine {
       this.masterGain = this.ctx.createGain();
       this.masterGain.gain.value = 0.92;
 
-      // Club-grade master glue compressor / peak limiter
+      // Club-grade master glue compressor + fast brickwall lookahead safety limiter
       this.compressor = this.ctx.createDynamicsCompressor();
       this.compressor.threshold.value = -6;
       this.compressor.knee.value = 8;
       this.compressor.ratio.value = 4;
       this.compressor.attack.value = 0.003;
       this.compressor.release.value = 0.16;
+
+      this.limiter = this.ctx.createDynamicsCompressor();
+      this.limiter.threshold.value = -1.0;
+      this.limiter.knee.value = 0;
+      this.limiter.ratio.value = 20;
+      this.limiter.attack.value = 0.001;
+      this.limiter.release.value = 0.05;
 
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 256;
@@ -90,9 +109,10 @@ export class ProMixerEngine {
 
       this.masterFilter.connect(this.masterGain);
       this.masterGain.connect(this.compressor);
-      this.compressor.connect(this.analyser);
+      this.compressor.connect(this.limiter);
+      this.limiter.connect(this.analyser);
       this.analyser.connect(this.ctx.destination);
-      this.compressor.connect(this.recordDest);
+      this.limiter.connect(this.recordDest);
 
       // Tempo-synced Ping-Pong Echo Bus
       this.echoDelayL = this.ctx.createDelay(2.0);
@@ -126,6 +146,7 @@ export class ProMixerEngine {
       this.decks.A = await this.#createDeck('A');
       this.decks.B = await this.#createDeck('B');
       this.drumSamples = await loadDrumSamplesForContext(this.ctx).catch(() => null);
+      await this.#startAudioClockWorklet();
     }
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
@@ -154,10 +175,12 @@ export class ProMixerEngine {
     strip.reverbSend.connect(this.reverbConvolver);
 
     let stretch = null;
+    let stretchLatencySec = 0;
     try {
       const SignalsmithStretch = await loadSignalsmith();
       stretch = await SignalsmithStretch(this.ctx);
       await stretch.configure({ blockMs: 90, intervalMs: 22, splitComputation: true });
+      stretchLatencySec = Number(await stretch.latency?.().catch(() => 0)) || 0;
       stretch.connect(strip.input);
     } catch (err) {
       console.warn(`Deck ${id} SignalsmithStretch fallback to native AudioBufferSourceNode:`, err?.message);
@@ -167,6 +190,7 @@ export class ProMixerEngine {
       id,
       strip,
       stretch,
+      stretchLatencySec,
       stemStretches: null,
       neuralStems: false,
       fallbackSource: null,
@@ -187,8 +211,10 @@ export class ProMixerEngine {
     };
 
     if (stretch) {
-      stretch.setUpdateInterval(0.05, (inputTime) => {
-        if (deck.playing && !deck.neuralStems) deck.position = inputTime;
+      stretch.setUpdateInterval(0.04, (inputTime) => {
+        if (deck.playing && !deck.neuralStems) {
+          deck.position = Math.max(0, inputTime - (deck.stretchLatencySec || 0));
+        }
       });
     }
     return deck;
@@ -209,11 +235,20 @@ export class ProMixerEngine {
     await Promise.all(
       STEM_NAMES.map(async (stem) => {
         const st = await SignalsmithStretch(this.ctx);
-        await st.configure({ blockMs: 90, intervalMs: 22, splitComputation: true });
+        // Vande Veire & De Bie: stretch percussive drums vs harmonic stems separately to cut artifacts
+        const isPercussive = stem === 'drums';
+        await st.configure({
+          blockMs: isPercussive ? 55 : 110,
+          intervalMs: isPercussive ? 14 : 26,
+          splitComputation: true,
+        });
         st.connect(deck.strip.stemInputs[stem]);
         if (stem === 'drums') {
-          st.setUpdateInterval(0.05, (inputTime) => {
-            if (deck.playing && deck.neuralStems) deck.position = inputTime;
+          deck.stretchLatencySec = Number(await st.latency?.().catch(() => deck.stretchLatencySec || 0)) || deck.stretchLatencySec || 0;
+          st.setUpdateInterval(0.04, (inputTime) => {
+            if (deck.playing && deck.neuralStems) {
+              deck.position = Math.max(0, inputTime - (deck.stretchLatencySec || 0));
+            }
           });
         }
         map[stem] = st;
@@ -221,6 +256,128 @@ export class ProMixerEngine {
     );
     deck.stemStretches = map;
     return map;
+  }
+
+  async #startAudioClockWorklet() {
+    if (!this.ctx) return;
+    if (this.ctx.audioWorklet && !this.clockWorkletNode) {
+      try {
+        const procCode = `
+          class NovaAudioClockProcessor extends AudioWorkletProcessor {
+            constructor() { super(); this._quanta = 0; }
+            process() {
+              if (++this._quanta >= 8) {
+                this._quanta = 0;
+                this.port.postMessage({ audioTime: currentTime });
+              }
+              return true;
+            }
+          }
+          registerProcessor('nova-audio-clock', NovaAudioClockProcessor);
+        `;
+        const blob = new Blob([procCode], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        await this.ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+        const node = new AudioWorkletNode(this.ctx, 'nova-audio-clock');
+        const silent = this.ctx.createGain();
+        silent.gain.value = 0;
+        node.connect(silent);
+        silent.connect(this.ctx.destination);
+        node.port.onmessage = (ev) => {
+          const audioTime = ev.data?.audioTime ?? this.ctx?.currentTime ?? 0;
+          for (const fn of this.clockListeners) {
+            try { fn(audioTime); } catch {}
+          }
+        };
+        this.clockWorkletNode = node;
+        this.clockMode = 'audioworklet';
+        return;
+      } catch {}
+    }
+
+    // Visual-sync requestAnimationFrame fallback strictly driven by ctx.currentTime (zero setInterval/setTimeout)
+    if (this.clockMode !== 'raf' && typeof requestAnimationFrame === 'function') {
+      this.clockMode = 'raf';
+      const step = () => {
+        if (this.ctx) {
+          const t = this.ctx.currentTime;
+          for (const fn of this.clockListeners) {
+            try { fn(t); } catch {}
+          }
+        }
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    }
+  }
+
+  addClockListener(fn) {
+    if (typeof fn === 'function') this.clockListeners.add(fn);
+    return () => this.clockListeners.delete(fn);
+  }
+
+  /**
+   * Records a genuinely scheduled Web Audio DSP event (zero fake/cosmetic events).
+   */
+  recordScheduledEvent({ startAt, endAt, category = 'fx', deckId = 'MASTER', label, detail = '', params = null } = {}) {
+    if (!this.ctx || !label) return null;
+    const now = this.ctx.currentTime;
+    const sAt = Number.isFinite(startAt) ? startAt : now;
+    const eAt = Math.max(sAt + 0.6, Number.isFinite(endAt) ? endAt : sAt + 2.5);
+    const dedupBucket = Math.round(sAt * 2);
+    const existing = this.scheduledEvents.find(
+      (ev) => ev.category === category && ev.deckId === deckId && ev.dedupBucket === dedupBucket && ev.label === label
+    );
+    if (existing) {
+      existing.endAt = Math.max(existing.endAt, eAt);
+      if (detail) existing.detail = detail;
+      return existing;
+    }
+    const entry = {
+      id: `dsp-${this._eventSeq++}`,
+      dedupBucket,
+      startAt: sAt,
+      endAt: eAt,
+      category,
+      deckId,
+      label,
+      detail,
+      params,
+    };
+    this.scheduledEvents.push(entry);
+    // Prune stale finished events (> 6s after end) on ctx.currentTime
+    if (this.scheduledEvents.length > 56) {
+      this.scheduledEvents = this.scheduledEvents.filter((ev) => ev.endAt >= now - 6).slice(-48);
+    }
+    return entry;
+  }
+
+  clearScheduledEvents() {
+    this.scheduledEvents = [];
+  }
+
+  getLiveEventsSnapshot(nowCtx = this.ctx?.currentTime ?? 0) {
+    const t = Number.isFinite(nowCtx) ? nowCtx : 0;
+    const active = [];
+    const upcoming = [];
+    const triggered = [];
+    for (const ev of this.scheduledEvents) {
+      if (t >= ev.startAt && t <= ev.endAt) {
+        const span = Math.max(0.25, ev.endAt - ev.startAt);
+        active.push({
+          ...ev,
+          progress01: Math.max(0, Math.min(1, (t - ev.startAt) / span)),
+          remainingSec: Math.max(0, Math.round((ev.endAt - t) * 10) / 10),
+        });
+      } else if (ev.startAt > t && ev.startAt <= t + 30) {
+        upcoming.push({ ...ev, startsInSec: Math.round((ev.startAt - t) * 10) / 10 });
+      }
+      if (t >= ev.startAt && ev.startAt >= t - 120) {
+        triggered.push(ev);
+      }
+    }
+    return { active, upcoming, triggered };
   }
 
   #ensureWorker() {
@@ -315,50 +472,85 @@ export class ProMixerEngine {
     }
 
     let buffer = null;
+    let contentHash = track.content_hash || track.analysis?.content_hash || null;
     if (track.file) {
       if (track.file.size > 180 * 1024 * 1024) {
         throw new Error(`${track.title} exceeds 180 MB browser decode limit.`);
       }
       const bytes = await track.file.arrayBuffer();
-      buffer = await this.ctx.decodeAudioData(bytes);
+      contentHash = contentHash || await computeAudioContentHash(bytes);
+      buffer = await this.ctx.decodeAudioData(bytes.slice(0));
     } else if (track.streamUrl) {
       const res = await fetch(track.streamUrl, { mode: 'cors', credentials: 'omit' });
       if (!res.ok) throw new Error(`Stream unavailable (HTTP ${res.status})`);
       const bytes = await res.arrayBuffer();
-      buffer = await this.ctx.decodeAudioData(bytes);
+      contentHash = contentHash || await computeAudioContentHash(bytes);
+      buffer = await this.ctx.decodeAudioData(bytes.slice(0));
     } else if (stemBuffers) {
       buffer = this.#sumStemBuffers(stemBuffers);
+      contentHash = contentHash || await computeAudioBufferHash(buffer);
     } else {
       throw new Error('Track has no decodable local file, stem bundle, or CORS stream.');
     }
 
     if (buffer.duration < 10) throw new Error('Track is shorter than 10 seconds.');
 
-    onProgress?.(`Analyzing beatgrid, downbeats, stems & key for ${track.title}…`);
-    const ch0 = buffer.getChannelData(0);
-    let mono;
-    let side = null;
-    const transfers = [];
-    if (buffer.numberOfChannels > 1) {
-      const ch1 = buffer.getChannelData(1);
-      mono = new Float32Array(ch0.length);
-      side = new Float32Array(ch0.length);
-      for (let i = 0; i < ch0.length; i++) {
-        mono[i] = 0.5 * (ch0[i] + ch1[i]);
-        side[i] = 0.5 * (ch0[i] - ch1[i]);
-      }
-      transfers.push(mono.buffer, side.buffer);
-    } else {
-      mono = new Float32Array(ch0);
-      transfers.push(mono.buffer);
+    // Check SHA-256 content-hash memory & IndexedDB cache first so every file is analyzed once
+    const memHit = this.decodedCache.get(`hash:${contentHash}`);
+    if (memHit) {
+      const cachedRec = {
+        buffer,
+        stemBuffers: stemBuffers || memHit.stemBuffers,
+        analysis: {
+          ...memHit.analysis,
+          cached: true,
+          content_hash: contentHash,
+          stems_available: Boolean(stemBuffers || memHit.stemBuffers),
+          stem_mode: (stemBuffers || memHit.stemBuffers) ? 'demucs-4stem' : 'eq-midside-off',
+        },
+      };
+      this.decodedCache.set(track.id, cachedRec);
+      return cachedRec;
     }
 
-    const worker = this.#ensureWorker();
-    const reqId = ++this.workerReqId;
-    let analysis = await new Promise((resolve, reject) => {
-      this.workerPending.set(reqId, { resolve, reject });
-      worker.postMessage({ id: reqId, mono, side, sampleRate: buffer.sampleRate }, transfers);
-    });
+    const storedAnalysis = await getCachedAnalysisByHash(contentHash);
+    let analysis = null;
+    if (storedAnalysis && storedAnalysis.beat_times?.length >= 4 && storedAnalysis.tracker_comparison) {
+      onProgress?.(`Loaded cached SHA-256 beatgrid & key for ${track.title}…`);
+      analysis = {
+        ...storedAnalysis,
+        cached: true,
+        content_hash: contentHash,
+      };
+    } else {
+      onProgress?.(`Dual-tracker analyzing beatgrid, downbeats, stems & key for ${track.title}…`);
+      const ch0 = buffer.getChannelData(0);
+      let mono;
+      let side = null;
+      const transfers = [];
+      if (buffer.numberOfChannels > 1) {
+        const ch1 = buffer.getChannelData(1);
+        mono = new Float32Array(ch0.length);
+        side = new Float32Array(ch0.length);
+        for (let i = 0; i < ch0.length; i++) {
+          mono[i] = 0.5 * (ch0[i] + ch1[i]);
+          side[i] = 0.5 * (ch0[i] - ch1[i]);
+        }
+        transfers.push(mono.buffer, side.buffer);
+      } else {
+        mono = new Float32Array(ch0);
+        transfers.push(mono.buffer);
+      }
+
+      const worker = this.#ensureWorker();
+      const reqId = ++this.workerReqId;
+      analysis = await new Promise((resolve, reject) => {
+        this.workerPending.set(reqId, { resolve, reject });
+        worker.postMessage({ id: reqId, mono, side, sampleRate: buffer.sampleRate }, transfers);
+      });
+      analysis.cached = false;
+      analysis.content_hash = contentHash;
+    }
 
     if (workerAnalysis) {
       analysis = {
@@ -368,13 +560,23 @@ export class ProMixerEngine {
         heat: analysis.heat,
         spectrum: analysis.spectrum,
         neuralStems: Boolean(stemBuffers),
+        stems_available: Boolean(stemBuffers),
+        stem_mode: stemBuffers ? 'demucs-4stem' : 'eq-midside-off',
       };
-    } else if (stemBuffers) {
-      analysis.neuralStems = true;
+    } else {
+      const hasStems = Boolean(stemBuffers && STEM_NAMES.every((s) => stemBuffers[s]));
+      analysis.neuralStems = hasStems;
+      analysis.stems_available = hasStems;
+      analysis.stem_mode = hasStems ? 'demucs-4stem' : 'eq-midside-off';
+    }
+
+    if (!analysis.cached) {
+      await saveCachedAnalysisByHash(contentHash, analysis);
     }
 
     const record = { buffer, stemBuffers, analysis };
     this.decodedCache.set(track.id, record);
+    this.decodedCache.set(`hash:${contentHash}`, record);
     return record;
   }
 
@@ -407,6 +609,12 @@ export class ProMixerEngine {
     track.heat = analysis.heat;
     track.lufs = analysis.lufs;
     track.neuralStems = deck.neuralStems;
+    track.stems_available = Boolean(deck.neuralStems);
+    track.stem_mode = deck.neuralStems ? 'demucs-4stem' : 'eq-midside-off';
+    track.content_hash = analysis.content_hash;
+    track.safe_transitions_only = Boolean(analysis.safe_transitions_only);
+    track.tracker_comparison = analysis.tracker_comparison || null;
+    track.analysis = analysis;
     if (track.cueConfidence !== 'user') {
       track.entrySec = entrySec;
       track.exitSec = exitSec;
@@ -541,6 +749,49 @@ export class ProMixerEngine {
     deck.stemFallbackSources = [];
   }
 
+  /**
+   * Schedules a sample-accurate deck stop on AudioContext.currentTime (zero setTimeout).
+   */
+  scheduleDeckStopAt(deckId, whenCtxTime) {
+    const deck = this.decks[deckId];
+    if (!deck || !this.ctx) return;
+    const stopAt = Math.max(this.ctx.currentTime + 0.02, whenCtxTime);
+    for (const st of this.#getDeckStretches(deck)) {
+      st.schedule({
+        output: stopAt,
+        outputTime: stopAt,
+        active: false,
+        rate: 1,
+        semitones: 0,
+        loopStart: 0,
+        loopEnd: 0,
+      }).catch(() => {});
+    }
+    if (deck.fallbackSource) {
+      try { deck.fallbackSource.stop(stopAt); } catch {}
+    }
+    for (const src of deck.stemFallbackSources || []) {
+      try { src.stop(stopAt); } catch {}
+    }
+  }
+
+  setDeckEqKill(deckId, band, killed) {
+    const deck = this.decks[deckId];
+    if (!deck?.strip || !this.ctx) return false;
+    const ok = deck.strip.setEqKill(band, killed, this.ctx.currentTime);
+    if (ok) {
+      this.recordScheduledEvent({
+        startAt: this.ctx.currentTime,
+        endAt: this.ctx.currentTime + (killed ? 3.0 : 1.2),
+        category: 'eq',
+        deckId,
+        label: killed ? `EQ KILL ${String(band).toUpperCase()}` : `EQ RESTORE ${String(band).toUpperCase()}`,
+        detail: killed ? `Deck ${deckId} ${band} frequency completely carved (-28dB)` : `Deck ${deckId} ${band} flat (0dB)`,
+      });
+    }
+    return ok;
+  }
+
   async pauseDeck(deckId) {
     const deck = this.decks[deckId];
     if (!deck || !deck.playing) return;
@@ -594,8 +845,9 @@ export class ProMixerEngine {
   getDeckPosition(deckId) {
     const deck = this.decks[deckId];
     if (!deck) return 0;
-    if (this.#getDeckStretches(deck).length) return deck.position;
     if (!deck.playing || !this.ctx) return deck.position;
+    if (deck.loopActive && this.#getDeckStretches(deck).length) return deck.position;
+    // Direct speaker-aligned timeline anchored to AudioContext.currentTime
     const elapsed = Math.max(0, this.ctx.currentTime - deck.startedAtCtx);
     return Math.min(deck.buffer?.duration || 0, deck.startedOffset + elapsed * deck.rate);
   }
@@ -775,6 +1027,18 @@ export class ProMixerEngine {
     outGain.cancelScheduledValues(startAt);
     inGain.cancelScheduledValues(startAt);
 
+    const outTitle = outDeck.track?.title || `Deck ${outDeckId}`;
+    const inTitle = inDeck.track?.title || `Deck ${inDeckId}`;
+    this.recordScheduledEvent({
+      startAt,
+      endAt,
+      category: 'blend',
+      deckId: 'MASTER',
+      label: `BLENDING: ${outTitle} → ${inTitle}`,
+      detail: `${style.replace(/_/g, ' ')} · ${plan.bars || 8} BARS · BEAT SYNCED`,
+      params: { style, bars: plan.bars || 8 },
+    });
+
     if (style === 'BASS_SWAP_16BAR' || style === 'HARMONIC_BLEND') {
       // Bring in Track B high-passed & bass-killed -> Instant Downbeat Bass Swap at 50% -> Smooth exit
       inDeck.strip.setStem('bass', 0.02, startAt, 0.02);
@@ -788,6 +1052,15 @@ export class ProMixerEngine {
       outDeck.strip.setStem('bass', 0.02, swapAt, 0.03);
       inDeck.strip.setStem('bass', 1.0, swapAt, 0.03);
 
+      this.recordScheduledEvent({
+        startAt: swapAt,
+        endAt: swapAt + 2.5,
+        category: 'eq',
+        deckId: 'MASTER',
+        label: 'EQ BASS SWAP (DOWNBEAT SLAM)',
+        detail: `Cutting ${outDeckId} Low (-28dB) · Slamming ${inDeckId} Low (0dB)`,
+      });
+
       outGain.setValueAtTime(1.0, startAt);
       outGain.setValueAtTime(0.92, swapAt);
       outGain.linearRampToValueAtTime(0.0001, endAt);
@@ -797,9 +1070,27 @@ export class ProMixerEngine {
       inDeck.strip.setStem('bass', 0.02, startAt, 0.02);
       inGain.setValueCurveAtTime(makeCurve(true), startAt, dur * 0.85);
 
+      this.recordScheduledEvent({
+        startAt,
+        endAt: startAt + dur * 0.45,
+        category: 'stem',
+        deckId: outDeckId,
+        label: `STEM VOCAL DUCK (${outDeckId})`,
+        detail: `Ducking Deck ${outDeckId} vocal to prevent lyrical clash`,
+      });
+
       const swapAt = startAt + dur * 0.45;
       outDeck.strip.setStem('bass', 0.02, swapAt, 0.03);
       inDeck.strip.setStem('bass', 1.0, swapAt, 0.03);
+
+      this.recordScheduledEvent({
+        startAt: swapAt,
+        endAt: swapAt + 2.5,
+        category: 'eq',
+        deckId: 'MASTER',
+        label: 'EQ BASS SWAP (DOWNBEAT SLAM)',
+        detail: `Handing off low-end foundation to Deck ${inDeckId}`,
+      });
 
       outGain.setValueAtTime(1.0, startAt);
       outGain.setValueCurveAtTime(makeCurve(false), startAt + dur * 0.25, dur * 0.75);
@@ -812,11 +1103,29 @@ export class ProMixerEngine {
       this.echoFeedback.gain.setValueAtTime(0.46, startAt);
       this.echoFeedback.gain.setValueAtTime(0.36, endAt);
 
+      this.recordScheduledEvent({
+        startAt,
+        endAt: startAt + dur * 0.65,
+        category: 'filter',
+        deckId: outDeckId,
+        label: 'HPF FILTER SWEEP & ECHO WASH',
+        detail: `Sweeping highpass + echo build on Deck ${outDeckId}`,
+      });
+
       inDeck.strip.setStem('bass', 0.05, startAt, 0.02);
       inGain.setValueAtTime(0.001, startAt);
       inGain.linearRampToValueAtTime(0.65, startAt + dur * 0.68);
       inGain.setValueAtTime(1.0, startAt + dur * 0.72);
       inDeck.strip.setStem('bass', 1.0, startAt + dur * 0.72, 0.02);
+
+      this.recordScheduledEvent({
+        startAt: startAt + dur * 0.72,
+        endAt: startAt + dur * 0.72 + 2.5,
+        category: 'blend',
+        deckId: inDeckId,
+        label: 'DROP SLAM IN (DOWNBEAT)',
+        detail: `Hard slam downbeat drop into Deck ${inDeckId}`,
+      });
 
       outGain.setValueAtTime(1.0, startAt);
       outGain.linearRampToValueAtTime(0.0001, startAt + dur * 0.76);
@@ -833,6 +1142,16 @@ export class ProMixerEngine {
       outDeck.strip.echoSend.gain.setValueAtTime(0.1, startAt);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0.48, startAt + dur * 0.8);
       outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
+
+      this.recordScheduledEvent({
+        startAt,
+        endAt: startAt + dur * 0.8,
+        category: 'loop',
+        deckId: outDeckId,
+        label: 'TENSION BEAT ROLL & FILTER',
+        detail: `1-bar to 1/2-bar beat roll tension on Deck ${outDeckId}`,
+      });
+
       outGain.setValueAtTime(1.0, startAt);
       outGain.setValueAtTime(1.0, startAt + dur * 0.82);
       outGain.linearRampToValueAtTime(0.0001, endAt);
@@ -851,6 +1170,16 @@ export class ProMixerEngine {
       for (const st of this.#getDeckStretches(outDeck)) {
         st.schedule({ output: brakeAt, outputTime: brakeAt, rate: 0.78, semitones: -4 });
       }
+
+      this.recordScheduledEvent({
+        startAt: brakeAt,
+        endAt: brakeAt + dur * 0.35,
+        category: 'fx',
+        deckId: outDeckId,
+        label: 'VINYL BRAKE & ECHO OUT',
+        detail: `Tape brake pitch drop + 1/2 beat echo tail on Deck ${outDeckId}`,
+      });
+
       outGain.setValueAtTime(1.0, startAt);
       outGain.linearRampToValueAtTime(0.0001, startAt + dur * 0.65);
 
@@ -906,6 +1235,99 @@ export class ProMixerEngine {
   }
 
   /**
+   * Renders an OfflineAudioContext mono/stereo AudioBuffer containing the track mixed
+   * with sample-accurate click ticks on every detected beat and accented pitches on downbeats.
+   */
+  async renderClickOverlayBuffer(trackOrRec, { maxDurationSec = null } = {}) {
+    const rec = trackOrRec?.buffer && trackOrRec?.analysis
+      ? trackOrRec
+      : await this.decodeAndAnalyze(trackOrRec);
+    const srcBuf = rec.buffer;
+    const analysis = rec.analysis;
+    const sr = srcBuf.sampleRate || 44100;
+    const dur = Math.min(srcBuf.duration, maxDurationSec || srcBuf.duration);
+    const totalFrames = Math.max(1, Math.floor(dur * sr));
+    const offline = new OfflineAudioContext(2, totalFrames, sr);
+
+    const src = offline.createBufferSource();
+    src.buffer = srcBuf;
+    const srcGain = offline.createGain();
+    srcGain.gain.value = 0.72;
+    src.connect(srcGain);
+    srcGain.connect(offline.destination);
+    src.start(0, 0, dur);
+
+    const beats = analysis.beat_times || [];
+    const dbs = new Set((analysis.downbeat_times || []).map((t) => Math.round(t * 20)));
+    const clickTimestamps = [];
+    for (let i = 0; i < beats.length; i++) {
+      const bt = beats[i];
+      if (bt < 0 || bt >= dur - 0.05) continue;
+      const isDown = dbs.has(Math.round(bt * 20));
+      const osc = offline.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(isDown ? 1720 : 1040, bt);
+      const g = offline.createGain();
+      g.gain.setValueAtTime(0.0001, bt);
+      g.gain.linearRampToValueAtTime(isDown ? 0.55 : 0.34, bt + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001, bt + 0.048);
+      osc.connect(g);
+      g.connect(offline.destination);
+      osc.start(bt);
+      osc.stop(bt + 0.055);
+      clickTimestamps.push({ t: bt, downbeat: isDown });
+    }
+
+    const rendered = await offline.startRendering();
+    return { rendered, clickTimestamps, analysis };
+  }
+
+  /**
+   * Auditions a track slice right from Debug Studio overlaid with detected beat clicks.
+   */
+  async previewBeatClickTrack(track, startSec = 0, durationSec = 14) {
+    await this.ensureContext();
+    const rec = await this.decodeAndAnalyze(track);
+    if (this._activeClickPreviewSrc) {
+      try { this._activeClickPreviewSrc.stop(); } catch {}
+      this._activeClickPreviewSrc = null;
+    }
+    const { buffer, analysis } = rec;
+    const safeStart = Math.max(0, Math.min(buffer.duration - 4, startSec));
+    const playLen = Math.min(durationSec, buffer.duration - safeStart);
+    const now = this.ctx.currentTime + 0.04;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    const gSong = this.ctx.createGain();
+    gSong.gain.setValueAtTime(0.75, now);
+    src.connect(gSong);
+    gSong.connect(this.ctx.destination);
+    src.start(now, safeStart, playLen);
+    src.stop(now + playLen + 0.02);
+    this._activeClickPreviewSrc = src;
+
+    const dbs = new Set((analysis.downbeat_times || []).map((t) => Math.round(t * 20)));
+    for (const bt of analysis.beat_times || []) {
+      if (bt < safeStart || bt > safeStart + playLen - 0.05) continue;
+      const at = now + (bt - safeStart);
+      const isDown = dbs.has(Math.round(bt * 20));
+      const osc = this.ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(isDown ? 1720 : 1040, at);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.linearRampToValueAtTime(isDown ? 0.42 : 0.24, at + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+      osc.connect(g);
+      g.connect(this.ctx.destination);
+      osc.start(at);
+      osc.stop(at + 0.06);
+    }
+    return { startAt: now, durationSec: playLen, beatCount: (analysis.beat_times || []).length };
+  }
+
+  /**
    * Executes a complete Phase 2/3 validated JSON transition recipe on AudioContext.currentTime.
    * Supports all 14 Phase 5 templates + stem curves + 3-band EQ kills + spinback/stutter + genre drums.
    */
@@ -921,10 +1343,10 @@ export class ProMixerEngine {
     const barSec = beatSec * 4;
 
     const grid = outDeck.analysis?.downbeat_times?.length ? outDeck.analysis.downbeat_times : outDeck.analysis?.beats || [];
-    let startAt = now + 0.16;
-    const nextBeat = grid.find((b) => b >= outPos + 0.16 && b <= outPos + barSec + 0.4);
+    let startAt = now + 0.32;
+    const nextBeat = grid.find((b) => b >= outPos + 0.30 && b <= outPos + barSec + 0.5);
     if (nextBeat !== undefined) {
-      startAt = Math.max(now + 0.16, now + (nextBeat - outPos) / Math.max(0.5, outDeck.rate || 1));
+      startAt = Math.max(now + 0.30, now + (nextBeat - outPos) / Math.max(0.5, outDeck.rate || 1));
     }
 
     const durBars = Math.max(2, Number(recipe.length_bars) || 16);
@@ -962,6 +1384,19 @@ export class ProMixerEngine {
     outGain.cancelScheduledValues(startAt);
     inGain.cancelScheduledValues(startAt);
 
+    const outTitle = outDeck.track?.title || `Deck ${outDeckId}`;
+    const inTitle = inDeck.track?.title || `Deck ${inDeckId}`;
+    const recipeType = (recipe.type || 'club_blend').replace(/_/g, ' ').toUpperCase();
+    this.recordScheduledEvent({
+      startAt,
+      endAt,
+      category: 'blend',
+      deckId: 'MASTER',
+      label: `BLENDING: ${outTitle} → ${inTitle}`,
+      detail: `${recipeType} · ${durBars} BARS · DOWNBEAT ALIGNED`,
+      params: { type: recipe.type, durBars },
+    });
+
     // Apply stem_layers gain automation curves
     const applyDeckCurve = (deck, songId, defStartGain, defEndGain) => {
       const volParam = deck.strip.deckVolume.gain;
@@ -979,6 +1414,16 @@ export class ProMixerEngine {
 
       for (const layer of (recipe.stem_layers || []).filter((s) => s.song === songId && s.stem !== 'all')) {
         if (!layer.gain_curve?.length) continue;
+        if (layer.stem === 'vocals' && layer.gain_curve.some(([_, g]) => g <= 0.3)) {
+          this.recordScheduledEvent({
+            startAt,
+            endAt: startAt + dur * 0.6,
+            category: 'stem',
+            deckId: deck.id,
+            label: `STEM VOCAL DUCK (${deck.id})`,
+            detail: `Ducking vocal stem on Deck ${deck.id} to eliminate lyrical clash`,
+          });
+        }
         for (const [b, g] of layer.gain_curve) {
           const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
           deck.strip.setStem(layer.stem, g, at, 0.06);
@@ -992,19 +1437,50 @@ export class ProMixerEngine {
     // Apply 3-band EQ automation points
     for (const eq of recipe.eq_automation || []) {
       const targetDeck = eq.deck === 'A' ? outDeck : inDeck;
+      const targetDeckId = eq.deck === 'A' ? outDeckId : inDeckId;
       if (!eq.points?.length) continue;
       for (const [b, db] of eq.points) {
         const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
         targetDeck.strip.setEqBand(eq.band, db, at, 0.04);
+        if (eq.band === 'low' && db <= -18) {
+          this.recordScheduledEvent({
+            startAt: at,
+            endAt: at + Math.max(1.8, barUnit * 2),
+            category: 'eq',
+            deckId: targetDeckId,
+            label: `EQ BASS CUT (-28dB)`,
+            detail: `Deck ${targetDeckId} low-end carved for clean bass handoff`,
+          });
+        } else if (eq.band === 'low' && db >= -2) {
+          this.recordScheduledEvent({
+            startAt: at,
+            endAt: at + Math.max(1.8, barUnit * 2),
+            category: 'eq',
+            deckId: targetDeckId,
+            label: `EQ BASS SLAM (0dB)`,
+            detail: `Deck ${targetDeckId} full low-end engaged on downbeat`,
+          });
+        }
       }
     }
 
     // Apply filter automation points
     for (const fl of recipe.filter_automation || []) {
       const targetDeck = fl.deck === 'A' ? outDeck : inDeck;
+      const targetDeckId = fl.deck === 'A' ? outDeckId : inDeckId;
       for (const [b, val] of fl.curve || []) {
         const at = startAt + Math.max(0, Math.min(durBars, b)) * barUnit;
         targetDeck.strip.setColorFilter(val, at, 0.06);
+        if (Math.abs(val) >= 0.45) {
+          this.recordScheduledEvent({
+            startAt: at,
+            endAt: at + Math.max(1.5, barUnit * 2),
+            category: 'filter',
+            deckId: targetDeckId,
+            label: val > 0 ? 'COLOR FILTER: HPF SWEEP' : 'COLOR FILTER: LPF SWEEP',
+            detail: `Deck ${targetDeckId} filter sweep at bar ${b}`,
+          });
+        }
       }
     }
 
@@ -1016,18 +1492,30 @@ export class ProMixerEngine {
         outDeck.strip.echoSend.gain.setValueAtTime(0, startAt);
         outDeck.strip.echoSend.gain.linearRampToValueAtTime(lvl, at + dur * 0.45);
         outDeck.strip.echoSend.gain.linearRampToValueAtTime(0, endAt);
+        this.recordScheduledEvent({
+          startAt: at,
+          endAt: at + dur * 0.45,
+          category: 'fx',
+          deckId: outDeckId,
+          label: 'STEREO PING-PONG ECHO DUB',
+          detail: `Tempo-locked echo delay wash on Deck ${outDeckId}`,
+        });
       } else if (fxItem.type === 'reverb') {
         const lvl = fxItem.params?.level ?? 0.55;
         outDeck.strip.reverbSend.gain.setValueAtTime(0, startAt);
         outDeck.strip.reverbSend.gain.linearRampToValueAtTime(lvl, at + dur * 0.55);
         outDeck.strip.reverbSend.gain.linearRampToValueAtTime(0, endAt);
+        this.recordScheduledEvent({
+          startAt: at,
+          endAt: at + dur * 0.55,
+          category: 'fx',
+          deckId: outDeckId,
+          label: 'CONVOLUTION REVERB WASH',
+          detail: `Spatial acoustic decay wash on Deck ${outDeckId}`,
+        });
       } else if (fxItem.type === 'loop_roll') {
         const anchor = outPos + (startAt - now) * Math.max(0.5, outDeck.rate);
-        const halfAt = at + dur * 0.45;
-        for (const st of this.#getDeckStretches(outDeck)) {
-          st.schedule({ output: at, outputTime: at, loopStart: Math.max(0, anchor - beatSec * 2), loopEnd: Math.max(0.2, anchor) });
-          st.schedule({ output: halfAt, outputTime: halfAt, loopStart: Math.max(0, anchor - beatSec), loopEnd: Math.max(0.1, anchor) });
-        }
+        this.triggerLoopRoll(outDeckId, [2, 1, 0.5], at, anchor, beatSec);
       } else if (fxItem.type === 'spinback') {
         const steps = 6;
         for (const st of this.#getDeckStretches(outDeck)) {
@@ -1036,23 +1524,42 @@ export class ProMixerEngine {
             st.schedule({ output: stAt, outputTime: stAt, rate: 1 - (s / steps) * 0.72, semitones: -s * 2 });
           }
         }
-      } else if (fxItem.type === 'riser_impact' || fxItem.type === 'impact' || fxItem.type === 'reverse_riser') {
-        this.playTransitionSweepFx({ type: fxItem.type === 'reverse_riser' ? 'echo_drop' : 'sweep_cut', bpm: outBpm, durationSec: Math.min(6, dur * 0.85) });
+        this.recordScheduledEvent({
+          startAt: at,
+          endAt: at + 0.85,
+          category: 'fx',
+          deckId: outDeckId,
+          label: 'VINYL SPINBACK BRAKE',
+          detail: `Turntable spinback brake on Deck ${outDeckId}`,
+        });
+      } else if (fxItem.type === 'tape_stop') {
+        this.triggerTapeStop(outDeckId, Math.min(1.6, beatSec * 2), at, false);
+      } else if (fxItem.type === 'reverse_riser') {
+        this.playReverseRiser(at, outBpm, Math.min(4, beatSec * 4));
+      } else if (fxItem.type === 'impact') {
+        this.playImpactHit(at);
+      } else if (fxItem.type === 'riser_impact') {
+        const riserDur = Math.min(4, Math.max(beatSec * 2, dur * 0.45));
+        this.playReverseRiser(at, outBpm, riserDur);
+        this.playImpactHit(at + riserDur);
       } else if (fxItem.type === 'stutter') {
         const div = Number(fxItem.params?.division_beats) || 0.25;
         const repeats = Math.min(16, Number(fxItem.params?.repeats) || 8);
-        const stepSec = beatSec * div;
-        for (let s = 0; s < repeats; s++) {
-          const stAt = at + s * stepSec;
-          outGain.setValueAtTime(1.0, stAt);
-          outGain.setValueAtTime(0.05, stAt + stepSec * 0.52);
-        }
+        this.triggerStutter(outDeckId, div, repeats, at);
       } else if (fxItem.type === 'key_lift') {
         const liftSemi = Math.max(-2, Math.min(2, Number(fxItem.params?.semitones) || 1));
         const liftAt = startAt + dur * 0.5;
         for (const st of this.#getDeckStretches(inDeck)) {
           st.schedule({ output: liftAt, outputTime: liftAt, semitones: liftSemi });
         }
+        this.recordScheduledEvent({
+          startAt: liftAt,
+          endAt,
+          category: 'harmonic',
+          deckId: inDeckId,
+          label: `KEY MODULATION LIFT (+${liftSemi > 0 ? '+' : ''}${liftSemi} SEMI)`,
+          detail: `Energizing harmonic pitch shift on Deck ${inDeckId}`,
+        });
       }
     }
 
@@ -1070,7 +1577,7 @@ export class ProMixerEngine {
 
   /**
    * Per-bar drift monitor comparing AudioContext playback clock against measured downbeat grid.
-   * Applies subtle +-0.4% pitch-locked rate micro-nudges across all active stem lanes if drift exceeds 15 ms.
+   * Applies subtle +-0.4% pitch-locked rate micro-nudges across all active stem lanes if drift exceeds 7 ms.
    */
   checkDriftAndCorrect(deckId) {
     const deck = this.decks[deckId];
@@ -1092,20 +1599,55 @@ export class ProMixerEngine {
       }
     }
     const driftMs = (pos - nearest) * 1000;
-    if (Math.abs(driftMs) > 15 && Math.abs(driftMs) < 95) {
+    if (Math.abs(driftMs) > 7 && Math.abs(driftMs) < 95) {
       const nudge = driftMs > 0 ? 0.996 : 1.004;
       for (const st of stretches) {
         st.schedule({ output: now + 0.04, outputTime: now + 0.04, rate: (deck.rate || 1) * nudge }).catch(() => {});
         st.schedule({ output: now + 0.44, outputTime: now + 0.44, rate: deck.rate || 1 }).catch(() => {});
       }
     }
-    return Math.round(driftMs);
+    return Math.round(driftMs * 10) / 10;
+  }
+
+  /**
+   * Measures real-time beat-phase offset in milliseconds between Deck A and Deck B on AudioContext.currentTime.
+   */
+  measureDualDeckDriftMs() {
+    const a = this.decks.A;
+    const b = this.decks.B;
+    if (!a?.playing || !b?.playing || !this.ctx) return null;
+    if (this.ctx.currentTime < Math.max(a.startedAtCtx || 0, b.startedAtCtx || 0) + 0.05) return null;
+    const beatsA = a.analysis?.beat_times || [];
+    const beatsB = b.analysis?.beat_times || [];
+    if (!beatsA.length || !beatsB.length) return null;
+    const posA = this.getDeckPosition('A');
+    const posB = this.getDeckPosition('B');
+    const nearPhase = (beats, pos, rate) => {
+      let best = beats[0];
+      let bd = Infinity;
+      for (let i = 0; i < beats.length; i++) {
+        const d = Math.abs(beats[i] - pos);
+        if (d < bd) { bd = d; best = beats[i]; }
+      }
+      return ((pos - best) / Math.max(0.5, rate || 1)) * 1000;
+    };
+    const pA = nearPhase(beatsA, posA, a.rate);
+    const pB = nearPhase(beatsB, posB, b.rate);
+    return Math.round(Math.abs(pA - pB) * 10) / 10;
   }
 
   async triggerSpinback(deckId) {
     const deck = this.decks[deckId];
     if (!deck?.playing) return;
     const now = this.ctx.currentTime + 0.02;
+    this.recordScheduledEvent({
+      startAt: now,
+      endAt: now + 0.85,
+      category: 'fx',
+      deckId,
+      label: 'VINYL SPINBACK BRAKE',
+      detail: `Turntable spinback brake on Deck ${deckId}`,
+    });
     const stretches = this.#getDeckStretches(deck);
     await Promise.all(
       stretches.map(async (st) => {
@@ -1119,8 +1661,190 @@ export class ProMixerEngine {
     );
   }
 
+  async triggerTapeStop(deckId, durationSec = 0.85, when = null, resumeAfter = true) {
+    const deck = this.decks[deckId];
+    if (!deck?.playing || !this.ctx) return;
+    const startAt = when ?? this.ctx.currentTime + 0.02;
+    const dur = Math.max(0.25, Math.min(2.5, durationSec));
+    this.recordScheduledEvent({
+      startAt,
+      endAt: startAt + dur,
+      category: 'fx',
+      deckId,
+      label: 'MOTOR TAPE STOP',
+      detail: `Analog tape motor slow-down on Deck ${deckId}`,
+    });
+    const stretches = this.#getDeckStretches(deck);
+    const baseRate = deck.rate || 1;
+    const baseSemi = deck.semitones || 0;
+    const steps = 10;
+    await Promise.all(
+      stretches.map(async (st) => {
+        for (let i = 1; i <= steps; i++) {
+          const frac = i / steps;
+          const at = startAt + frac * dur;
+          const r = Math.max(0.06, baseRate * Math.pow(1 - frac, 1.7));
+          const s = baseSemi - Math.round(frac * 20);
+          await st.schedule({ output: at, outputTime: at, rate: r, semitones: s });
+        }
+        if (resumeAfter) {
+          const recAt = startAt + dur + 0.14;
+          await st.schedule({ output: recAt, outputTime: recAt, rate: baseRate, semitones: baseSemi });
+        } else {
+          await st.schedule({ output: startAt + dur + 0.02, outputTime: startAt + dur + 0.02, active: false });
+        }
+      })
+    );
+  }
+
+  triggerLoopRoll(deckId, divisions = [2, 1, 0.5, 0.25], when = null, anchorOffset = null, beatSecOverride = null) {
+    const deck = this.decks[deckId];
+    if (!deck?.playing || !this.ctx) return;
+    const startAt = when ?? this.ctx.currentTime + 0.02;
+    const bpm = (deck.analysis?.bpm || 120) * (deck.rate || 1);
+    const beatSec = beatSecOverride || 60 / Math.max(55, bpm);
+    const anchor = anchorOffset ?? this.getDeckPosition(deckId);
+    const stretches = this.#getDeckStretches(deck);
+    let cursor = startAt;
+    for (const div of divisions) {
+      const sliceDur = Math.max(0.08, beatSec * div);
+      for (const st of stretches) {
+        st.schedule({
+          output: cursor,
+          outputTime: cursor,
+          loopStart: Math.max(0, anchor),
+          loopEnd: Math.min(deck.buffer?.duration || anchor + sliceDur, anchor + sliceDur),
+        }).catch(() => {});
+      }
+      cursor += sliceDur * 2;
+    }
+    const rollDur = cursor - startAt;
+    this.recordScheduledEvent({
+      startAt,
+      endAt: startAt + rollDur,
+      category: 'loop',
+      deckId,
+      label: 'QUANTIZED LOOP ROLL',
+      detail: `Subdividing beat slice roll tension on Deck ${deckId}`,
+    });
+    for (const st of stretches) {
+      st.schedule({ output: cursor, outputTime: cursor, loopStart: 0, loopEnd: 0 }).catch(() => {});
+    }
+  }
+
+  triggerStutter(deckId, divisionBeats = 0.25, repeats = 8, when = null) {
+    const deck = this.decks[deckId];
+    if (!deck?.playing || !this.ctx) return;
+    const startAt = when ?? this.ctx.currentTime + 0.02;
+    const bpm = (deck.analysis?.bpm || 120) * (deck.rate || 1);
+    const stepSec = (60 / Math.max(55, bpm)) * divisionBeats;
+    this.recordScheduledEvent({
+      startAt,
+      endAt: startAt + repeats * stepSec,
+      category: 'fx',
+      deckId,
+      label: `CHOP STUTTER (1/${Math.round(4 / divisionBeats)}T)`,
+      detail: `${repeats}-hit rhythmic gate stutter on Deck ${deckId}`,
+    });
+    const g = deck.strip.deckVolume.gain;
+    for (let s = 0; s < repeats; s++) {
+      const stAt = startAt + s * stepSec;
+      g.setValueAtTime(1.0, stAt);
+      g.setValueAtTime(0.04, stAt + stepSec * 0.52);
+    }
+    g.setValueAtTime(1.0, startAt + repeats * stepSec);
+  }
+
+  playReverseRiser(when = null, bpm = 122, durationSec = 2.5) {
+    if (!this.ctx || !this.masterFilter) return;
+    const t0 = when ?? this.ctx.currentTime + 0.02;
+    const dur = Math.max(0.6, Math.min(6.0, durationSec));
+    this.recordScheduledEvent({
+      startAt: t0,
+      endAt: t0 + dur,
+      category: 'riser',
+      deckId: 'MASTER',
+      label: 'REVERSE WHITE NOISE RISER',
+      detail: `Synthesized frequency tension build (${Math.round(bpm)} BPM)`,
+    });
+    const len = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const ch = buf.getChannelData(0);
+    // Exponential reverse amplitude contour ending abruptly right before t0 + dur drop
+    let s = 1337;
+    for (let i = 0; i < len; i++) {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      const white = (s / 0xffffffff) * 2 - 1;
+      const env = Math.pow(i / Math.max(1, len - 1), 3.1);
+      ch[i] = white * env * 0.55;
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 3.2;
+    bp.frequency.setValueAtTime(220, t0);
+    bp.frequency.exponentialRampToValueAtTime(7200, t0 + dur * 0.96);
+
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(Math.max(80, bpm * 0.9), t0);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(220, bpm * 4.5), t0 + dur * 0.96);
+
+    const og = this.ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t0);
+    og.gain.exponentialRampToValueAtTime(0.11, t0 + dur * 0.94);
+    og.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+
+    src.connect(bp);
+    bp.connect(og);
+    osc.connect(bp);
+    og.connect(this.masterFilter);
+    og.connect(this.reverbConvolver);
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  }
+
+  playImpactHit(when = null) {
+    if (!this.ctx || !this.masterFilter) return;
+    const t0 = when ?? this.ctx.currentTime + 0.02;
+    this.recordScheduledEvent({
+      startAt: t0,
+      endAt: t0 + 0.65,
+      category: 'impact',
+      deckId: 'MASTER',
+      label: 'SUB IMPACT DROP',
+      detail: '40Hz sine sub boom downbeat impact',
+    });
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(118, t0);
+    osc.frequency.exponentialRampToValueAtTime(36, t0 + 0.45);
+    const og = this.ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t0);
+    og.gain.linearRampToValueAtTime(0.28, t0 + 0.008);
+    og.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.65);
+    osc.connect(og);
+    og.connect(this.masterFilter);
+    osc.start(t0);
+    osc.stop(t0 + 0.68);
+  }
+
   #schedulePercussionBridge(when, bpm, bars, style = 'house', peakGain = 0.24) {
     if (!this.ctx) return;
+    const beatSec = 60 / Math.max(50, bpm);
+    const durSec = bars * 4 * beatSec;
+    this.recordScheduledEvent({
+      startAt: when,
+      endAt: when + durSec,
+      category: 'drum',
+      deckId: 'MASTER',
+      label: `ADDED DRUM BRIDGE: ${style.toUpperCase()}`,
+      detail: `${bars} bars live ${style} studio percussion layer`,
+      params: { style, bars, bpm },
+    });
     scheduleStudioDrumBridge(this.ctx, this.masterFilter, {
       when,
       bpm,
@@ -1129,6 +1853,26 @@ export class ProMixerEngine {
       peakGain,
       samples: this.drumSamples,
     });
+  }
+
+  triggerAutonomousPhraseOverlay(deckId, style = 'house', bars = 2) {
+    const deck = this.decks[deckId];
+    if (!deck?.playing || !this.ctx) return null;
+    const now = this.ctx.currentTime;
+    const pos = this.getDeckPosition(deckId);
+    const bpm = (deck.analysis?.bpm || 120) * (deck.rate || 1);
+    const beatSec = 60 / Math.max(55, bpm);
+    const barSec = beatSec * 4;
+
+    const grid = deck.analysis?.downbeat_times?.length ? deck.analysis.downbeat_times : deck.analysis?.beats || [];
+    let startAt = now + 0.15;
+    const nextBeat = grid.find((b) => b >= pos + 0.12 && b <= pos + barSec + 0.2);
+    if (nextBeat !== undefined) {
+      startAt = Math.max(now + 0.12, now + (nextBeat - pos) / Math.max(0.5, deck.rate || 1));
+    }
+
+    this.#schedulePercussionBridge(startAt, bpm, bars, style, 0.22);
+    return { startAt, durationSec: bars * barSec, style, bars };
   }
 
   getSpectrumEnergy() {

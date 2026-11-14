@@ -30,6 +30,31 @@ export const SAFE_TRANSITIONS = new Set([
   'spinback',
 ]);
 
+// Vande Veire & De Bie (2018) State Machine Families: prevents adjacent transitions repeating the same move
+export const TRANSITION_FAMILIES = {
+  rolling: new Set(['bass_swap_blend', 'drum_loop_bridge', 'filter_sweep', 'half_time_switch']),
+  relaxed: new Set(['long_blend', 'reverb_wash', 'echo_out', 'lyric_link', 'key_change_lift']),
+  double_drop: new Set([
+    'build_up_drop',
+    'loop_roll_drop',
+    'reverse_riser_drop',
+    'impact_cut',
+    'stutter_edit',
+    'spinback',
+    'vocal_mashup',
+    'hook_over_groove',
+    'acapella_in',
+    'instrumental_in',
+  ]),
+};
+
+export function getTransitionFamily(type) {
+  for (const [fam, set] of Object.entries(TRANSITION_FAMILIES)) {
+    if (set.has(type)) return fam;
+  }
+  return 'rolling';
+}
+
 export const GENRE_PLAYBOOKS = {
   punjabi: {
     label: 'Punjabi / Bhangra',
@@ -112,7 +137,12 @@ export function normalizeSongAnalysis(track) {
     ? (a.beat_times || a.beats)
     : null;
 
-  if (!bars) {
+  if (bars) {
+    bars = bars.map((b, i) => ({
+      ...b,
+      bar: Number.isFinite(b.bar) ? b.bar : (Number.isFinite(b.bar_index) ? b.bar_index : i),
+    }));
+  } else {
     bars = [];
     const barCountEst = Math.max(8, Math.floor(durationSec / barSec));
     for (let i = 0; i < barCountEst; i++) {
@@ -171,12 +201,12 @@ export function normalizeSongAnalysis(track) {
 
   const sections = Array.isArray(a.sections) && a.sections.length
     ? a.sections.map((s) => ({
-        type: s.type || 'verse',
+        type: s.type || s.label || 'verse',
         start_bar: Number.isFinite(s.start_bar) ? s.start_bar : Math.max(0, Math.round((s.start_sec || 0) / barSec)),
         end_bar: Number.isFinite(s.end_bar) ? s.end_bar : Math.min(barCount, Math.round((s.end_sec || durationSec) / barSec)),
         start_sec: s.start_sec ?? 0,
         end_sec: s.end_sec ?? durationSec,
-        energy: s.energy ?? 0.6,
+        energy: s.energy ?? s.energy_avg ?? 0.6,
       }))
     : [
         { type: 'intro', start_bar: 0, end_bar: Math.min(8, barCount), start_sec: 0, end_sec: Math.min(durationSec, 8 * barSec), energy: 0.45 },
@@ -262,11 +292,38 @@ export function normalizeSongAnalysis(track) {
       drum_feel: playbook.drumStyle,
     },
     genreKey: track.genreKey || gKey,
-    warnings: Array.isArray(a.warnings) ? a.warnings : (track.warnings || (!track.dspReady && !track.isDsp ? ['youtube_metadata_grid'] : [])),
+    bpm_confidence: a.bpm_confidence ?? a.bpmConfidence ?? 0.75,
+    warnings: Array.isArray(a.warnings) ? a.warnings : (track.warnings || []),
     tempo_stability: a.tempo_stability || { drift_pct: 0, is_variable: false, free_time_intro_sec: 0, tempo_changes: [] },
+    content_hash: a.content_hash || track.content_hash || null,
+    cached: Boolean(a.cached ?? track.cached),
+    tracker_comparison: a.tracker_comparison || track.tracker_comparison || null,
+    low_confidence: Boolean(a.low_confidence ?? track.low_confidence),
+    safe_transitions_only: Boolean(a.safe_transitions_only ?? track.safe_transitions_only),
+    neuralStems: Boolean(a.neuralStems || track.neuralStems || a.stems_available || track.stems_available),
+    stems_available: Boolean(a.stems_available ?? track.stems_available ?? a.neuralStems ?? track.neuralStems),
+    stem_mode: a.stem_mode || track.stem_mode || ((a.neuralStems || track.neuralStems) ? 'demucs-4stem' : 'eq-midside-off'),
     heat,
     isDsp: Boolean(track.file || track.stemFiles || track.stemUrls || track.neuralStems || track.isDsp || (track.dspReady && track.streamUrl)),
   };
+}
+
+function findProtectedRangeOverlap(song, startBar, lenBars = 1) {
+  const ranges = song?.lyric_understanding?.do_not_cut_ranges || [];
+  if (!ranges.length || !song?.bars?.length) return null;
+  const sIdx = Math.max(0, Math.min(song.bars.length - 1, Number(startBar) || 0));
+  const eIdx = Math.max(sIdx, Math.min(song.bars.length - 1, sIdx + Math.max(0, (Number(lenBars) || 1) - 1)));
+  const winStart = song.bars[sIdx]?.start_sec;
+  const winEnd = song.bars[eIdx]?.end_sec ?? winStart;
+  if (!Number.isFinite(winStart) || !Number.isFinite(winEnd)) return null;
+  for (const r of ranges) {
+    const rStart = Number(r.start_sec);
+    const rEnd = Number(r.end_sec);
+    if ((winStart > rStart + 0.8 && winStart < rEnd - 0.8) || (rStart + 0.8 < winEnd && rEnd - 0.8 > winStart)) {
+      return { reason: r.reason || 'hook', winStart, winEnd, rStart, rEnd };
+    }
+  }
+  return null;
 }
 
 /**
@@ -336,13 +393,113 @@ function getArcDir(arc = 'peak', moodEnergy = null) {
 }
 
 /**
- * Computes Pair Compatibility Score:
- * S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R
- * Returns top 5 ranked candidate transition mix points for the AI Planner.
+ * DJustify Cue Card Shortlist Generator:
+ * Precomputes phrase-aligned candidate cut-out and entry-in bars (phrase ends,
+ * section boundaries, harmonic restarts, post-vocal phrase ends, and bass onsets)
+ * so both heuristic & LLM planners choose from clean DJ cues instead of a blank timeline.
  */
-export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'club', moodEnergy = null } = {}) {
+export function buildCueCard(song, role = 'out', playMode = 'club') {
+  const barCount = Math.max(1, song.bar_count || 16);
+  const barDur = 240 / Math.max(55, song.bpm || 120);
+  const cues = [];
+  const pushCue = (bar, reason, scoreBias = 0) => {
+    const b = Math.max(0, Math.min(barCount - 1, Math.round(bar)));
+    if (!cues.some((c) => c.bar === b)) {
+      cues.push({ bar, b, sec: Math.round((song.bars?.[b]?.start_sec ?? b * barDur) * 10) / 10, reason, scoreBias });
+    }
+  };
+
+  if (role === 'out') {
+    const maxSafeOut = Math.max(1, barCount - (barCount >= 40 ? 16 : 6));
+    const minSafeOut = barCount >= 40 ? Math.max(8, barCount - 32) : Math.max(2, Math.floor(barCount * 0.45));
+
+    // Vocal-phrase end cues (strictly after protected vocal phrases)
+    const protRanges = song.lyric_understanding?.do_not_cut_ranges || [];
+    for (const r of protRanges) {
+      const endBar = Math.ceil((Number(r.end_sec) || 0) / barDur);
+      const aligned = endBar + ((4 - (endBar % 4)) % 4);
+      if (aligned >= minSafeOut && aligned <= maxSafeOut) {
+        pushCue(aligned, 'vocal_phrase_end', 0.08);
+      }
+    }
+
+    if (playMode === 'hooks' && barCount >= 12) {
+      const mid = Math.min(maxSafeOut, Math.max(8, Math.round(barCount * 0.55)));
+      pushCue(Math.min(maxSafeOut, Math.max(4, mid - (mid % 8))), 'hook_exit', 0.06);
+    }
+
+    const preOutroBar = song.sections.find((s) => s.type === 'outro')?.start_bar;
+    if (preOutroBar && preOutroBar >= 8) {
+      const targetPhrase = Math.max(8, preOutroBar - (preOutroBar % 8));
+      if (targetPhrase <= maxSafeOut) pushCue(targetPhrase, 'section_pre_outro', 0.09);
+    }
+
+    const latePhrase = (song.phrase_boundaries || [])
+      .map((p) => p.bar)
+      .filter((b) => b >= minSafeOut && b <= maxSafeOut && (song.energy_per_bar[b] ?? 0.6) >= 0.35);
+    for (const b of latePhrase) pushCue(b, b % 16 === 0 ? '16bar_phrase_end' : '8bar_phrase_end', b % 16 === 0 ? 0.05 : 0.02);
+
+    // Bass dropout cue in outgoing energy/bass curve
+    const bassArr = song.stem_activity?.bass || [];
+    for (let b = minSafeOut; b <= maxSafeOut; b += 4) {
+      if ((bassArr[b] ?? 0.6) < 0.35 && (bassArr[Math.max(0, b - 4)] ?? 0.6) >= 0.55) {
+        pushCue(b, 'bass_dropout', 0.06);
+      }
+    }
+
+    if (!cues.length) {
+      const defBar = Math.min(maxSafeOut, Math.max(0, Math.floor(barCount * 0.6) - (Math.floor(barCount * 0.6) % 4)));
+      pushCue(Math.min(maxSafeOut, defBar), 'fallback_phrase', 0);
+    }
+    return cues.slice(0, 5).map(({ b, sec, reason, scoreBias }) => ({ bar: b, sec, reason, scoreBias }));
+  }
+
+  // role === 'in'
+  if (song.tempo_stability?.free_time_intro_sec >= 4.0) {
+    const afterIntroBar = Math.ceil(song.tempo_stability.free_time_intro_sec / barDur);
+    const aligned = afterIntroBar + ((4 - (afterIntroBar % 4)) % 4);
+    if (aligned < barCount - 12) pushCue(aligned, 'post_free_time_intro', 0.1);
+  }
+
+  const chorusOrDrop = song.sections.find((s) => s.type === 'chorus' || s.type === 'drop');
+  if (chorusOrDrop && chorusOrDrop.start_bar < barCount - 12) {
+    const cb = Math.max(0, chorusOrDrop.start_bar - (chorusOrDrop.start_bar % 4));
+    if (playMode === 'hooks' || playMode === 'festival') {
+      pushCue(cb, 'chorus_drop_restart', 0.1);
+    } else {
+      pushCue(cb, 'chorus_restart', 0.04);
+    }
+  }
+
+  const introSec = song.sections.find((s) => s.type === 'intro');
+  if (introSec && introSec.end_bar < barCount - 16) {
+    const harmonicRestart = Math.max(0, introSec.end_bar - (introSec.end_bar % 4));
+    pushCue(harmonicRestart, 'harmonic_restart_verse', 0.08);
+  }
+
+  const buildBar = song.sections.find((s) => s.type === 'build')?.start_bar;
+  if (buildBar && buildBar < barCount - 16) {
+    pushCue(buildBar - (buildBar % 4), 'build_onset', 0.06);
+  }
+
+  // Bass onset bar (first beat where bass hits full groove)
+  const bassArr = song.stem_activity?.bass || [];
+  const bassOnsetIdx = bassArr.findIndex((v, i) => i < barCount - 14 && i % 4 === 0 && v >= 0.62);
+  if (bassOnsetIdx > 0) pushCue(bassOnsetIdx, 'bass_onset', 0.05);
+
+  pushCue(0, 'bar_0_intro', 0);
+  return cues.slice(0, 4).map(({ b, sec, reason, scoreBias }) => ({ bar: b, sec, reason, scoreBias }));
+}
+
+/**
+ * Computes Pair Compatibility Score (Mosaikbox ISMIR 2024: acoustic/structural metrics only, zero lyric-similarity dilution):
+ * S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R
+ * Returns top 5 ranked candidate transition mix points drawn from DJustify Cue Cards.
+ */
+export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'club', moodEnergy = null, prevFamily = null } = {}) {
   const tempo = computeTempoFit(songA.bpm, songB.bpm);
   const keyFit = computeKeyFit(songA.key_camelot, songB.key_camelot);
+  const bpmGapAbs = Math.abs((songA.bpm || 120) - (tempo.effectiveBpmB || songB.bpm || 120));
 
   // Genre & mood bridge G
   const sameGenre = songA.genreKey === songB.genreKey;
@@ -355,59 +512,35 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
   if (songA.warnings.includes('low_confidence') || songB.warnings.includes('low_confidence')) R += 0.05;
   R = Math.min(0.3, Math.round(R * 1000) / 1000);
 
-  // Build candidate mix-out bars in A & mix-in bars in B (strictly bounded within short & long songs)
-  const outCandidates = [];
-  const maxSafeOut = Math.max(1, songA.bar_count - 4);
-  if (playMode === 'hooks' && songA.bar_count >= 12) {
-    const mid = Math.min(maxSafeOut, Math.max(4, Math.round(songA.bar_count * 0.55)));
-    outCandidates.push(Math.min(maxSafeOut, Math.max(4, mid - (mid % 8))));
-  }
-  const latePhrase = songA.phrase_boundaries
-    .map((p) => p.bar)
-    .filter((b) => b >= Math.max(4, songA.bar_count - 40) && b <= Math.max(4, songA.bar_count - 8) && b <= maxSafeOut);
-  for (const b of latePhrase) outCandidates.push(b);
-  const outroSec = songA.sections.find((s) => s.type === 'outro');
-  if (outroSec && outroSec.start_bar >= 4 && outroSec.start_bar <= maxSafeOut) {
-    outCandidates.push(outroSec.start_bar);
-  }
-  if (!outCandidates.length) {
-    outCandidates.push(Math.min(maxSafeOut, Math.max(1, Math.floor(songA.bar_count * 0.5))));
-  }
-  const uniqueOut = [...new Set(outCandidates)].slice(0, 4);
-
-  const inCandidates = [0];
-  if (playMode === 'hooks') {
-    const ch = songB.sections.find((s) => s.type === 'chorus');
-    if (ch) inCandidates.unshift(Math.max(0, ch.start_bar - (ch.start_bar % 4)));
-  }
-  const introEnd = songB.sections.find((s) => s.type === 'intro')?.end_bar;
-  if (introEnd && introEnd < songB.bar_count - 16) inCandidates.push(introEnd - (introEnd % 4));
-  const buildBar = songB.sections.find((s) => s.type === 'build')?.start_bar;
-  if (buildBar && buildBar < songB.bar_count - 16) inCandidates.push(buildBar - (buildBar % 4));
-  if (songB.tempo_stability?.free_time_intro_sec >= 6) {
-    const afterIntroBar = Math.ceil(songB.tempo_stability.free_time_intro_sec / (240 / songB.bpm));
-    if (afterIntroBar < songB.bar_count - 12) inCandidates.unshift(afterIntroBar);
-  }
-  const uniqueIn = [...new Set(inCandidates)].slice(0, 3);
+  // DJustify Cue Cards shortlist
+  const cueOutCard = buildCueCard(songA, 'out', playMode);
+  const cueInCard = buildCueCard(songB, 'in', playMode);
 
   const arcDir = getArcDir(arc, moodEnergy);
-  const unsafeSong = songA.warnings.includes('no_clear_beat') || songB.warnings.includes('no_clear_beat') || songA.warnings.includes('variable_tempo') || songB.warnings.includes('variable_tempo');
-
-  const overlapsProtectedRange = (song, barIdx) => {
-    const sec = song.bars?.[barIdx]?.start_sec;
-    if (!Number.isFinite(sec)) return false;
-    return (song.lyric_understanding?.do_not_cut_ranges || []).some(
-      (r) => sec > Number(r.start_sec) + 0.8 && sec < Number(r.end_sec) - 0.8
-    );
-  };
+  const unsafeSong = Boolean(
+    songA.safe_transitions_only ||
+    songB.safe_transitions_only ||
+    songA.warnings.includes('no_clear_beat') ||
+    songB.warnings.includes('no_clear_beat') ||
+    songA.warnings.includes('variable_tempo') ||
+    songB.warnings.includes('variable_tempo') ||
+    songA.warnings.includes('low_confidence') ||
+    songB.warnings.includes('low_confidence')
+  );
 
   const scored = [];
-  for (const outBar of uniqueOut) {
-    for (const inBar of uniqueIn) {
-      const lengthBars = tempo.diffPct <= 6 ? 16 : tempo.diffPct <= 8 ? 8 : 4;
+  for (const cOut of cueOutCard) {
+    const outBar = cOut.bar;
+    for (const cIn of cueInCard) {
+      const inBar = cIn.bar;
+      // Tighten tempo blend window: long 16-bar blends within +-3.2 BPM, shorter 8-bar up to 8%, else 4-bar quick cut
+      const lengthBars = bpmGapAbs <= 3.2 ? 16 : tempo.diffPct <= 8 ? 8 : 4;
       const safeLen = Math.max(4, Math.min(lengthBars, songA.bar_count - outBar, songB.bar_count - inBar));
       const secA = barSectionAt(songA, outBar);
       const secB = barSectionAt(songB, inBar + Math.min(4, Math.floor(safeLen / 2)));
+
+      // Structure Gate guard: avoid landing inside a low-energy incoming intro during peak/festival sets
+      const introTrap = (secB.type === 'intro' && (secB.energy ?? 0.5) < 0.42 && arc !== 'warmup' && cIn.reason === 'bar_0_intro') ? 0.08 : 0;
 
       // Energy fit E
       const eDelta = (secB.energy ?? 0.65) - (secA.energy ?? 0.65);
@@ -419,7 +552,7 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
 
       // Phrase fit P
       let P = (outBar % 16 === 0 && inBar % 16 === 0) ? 0.9 : (outBar % 8 === 0 && inBar % 8 === 0) ? 0.72 : 0.48;
-      if (secA.type === 'outro' && (secB.type === 'intro' || secB.type === 'build')) P = Math.min(1, P + 0.15);
+      if (secA.type === 'outro' && (secB.type === 'intro' || secB.type === 'build' || secB.type === 'verse')) P = Math.min(1, P + 0.15);
       P = Math.round(P * 1000) / 1000;
 
       // Vocal clearance V across overlap window
@@ -431,13 +564,13 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
       }
       const V = Math.round((1 - clashBars / Math.max(1, safeLen)) * 1000) / 1000;
 
-      // Choose best transition template per Master Prompt rules
+      // Choose best transition template with Pro +-3.2 BPM rule & Vande Veire family variety
       let type = 'bass_swap_blend';
       if (unsafeSong) {
         type = 'echo_out';
       } else if (tempo.octaveMode !== 'direct' && tempo.diffPct <= 6) {
         type = 'half_time_switch';
-      } else if (tempo.diffPct > 8) {
+      } else if (tempo.diffPct > 8 || (bpmGapAbs > 4.5 && tempo.diffPct > 5)) {
         type = eDelta > 0.18 ? 'build_up_drop' : 'echo_out';
       } else if (!sameGenre && (songA.genreKey === 'punjabi' || songB.genreKey === 'punjabi' || songA.genreKey === 'bollywood')) {
         type = 'drum_loop_bridge';
@@ -449,23 +582,41 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
         type = 'build_up_drop';
       } else if (eDelta < -0.2) {
         type = 'reverb_wash';
-      } else if (keyFit.distance === 0 && tempo.diffPct <= 3 && safeLen >= 16) {
+      } else if (keyFit.distance === 0 && bpmGapAbs <= 3.2 && safeLen >= 16) {
         type = 'long_blend';
       }
 
-      const rawScore = 0.25 * tempo.T + 0.2 * keyFit.K + 0.15 * E + 0.15 * P + 0.15 * V + 0.1 * G - R;
-      const protPenalty = (overlapsProtectedRange(songA, outBar) || overlapsProtectedRange(songB, inBar)) ? 0.28 : 0;
+      // Vande Veire State Machine: avoid repeating the same family back-to-back
+      if (prevFamily && getTransitionFamily(type) === prevFamily && !unsafeSong) {
+        if (prevFamily === 'rolling') {
+          type = eDelta >= 0.08 ? 'reverse_riser_drop' : 'reverb_wash';
+        } else if (prevFamily === 'double_drop') {
+          type = bpmGapAbs <= 3.2 && keyFit.distance <= 1 ? 'bass_swap_blend' : 'filter_sweep';
+        } else {
+          type = eDelta >= 0 ? 'build_up_drop' : 'bass_swap_blend';
+        }
+      }
+
+      const cueBonus = (cOut.scoreBias || 0) + (cIn.scoreBias || 0) - introTrap;
+      const rawScore = 0.25 * tempo.T + 0.2 * keyFit.K + 0.15 * E + 0.15 * P + 0.15 * V + 0.1 * G - R + cueBonus * 0.25;
+      const protA = findProtectedRangeOverlap(songA, outBar, safeLen);
+      const protB = findProtectedRangeOverlap(songB, inBar, safeLen);
+      const protPenalty = (protA || protB) ? 0.65 : 0;
       const S = Math.round(Math.max(0.05, Math.min(1, rawScore - protPenalty)) * 1000) / 1000;
 
       scored.push({
         mix_out_bar: outBar,
         mix_in_bar: inBar,
+        cue_out_reason: cOut.reason,
+        cue_in_reason: cIn.reason,
         length_bars: safeLen,
         type,
+        family: getTransitionFamily(type),
         pitch_shift_semitones: keyFit.bestShift,
         stretch_ratio: tempo.diffPct <= 8 ? tempo.stretchRatio : 1,
         octave_mode: tempo.octaveMode,
         bpm_diff_pct: tempo.diffPct,
+        bpm_gap_abs: Math.round(bpmGapAbs * 10) / 10,
         score: S,
         breakdown: {
           T: tempo.T,
@@ -487,6 +638,8 @@ export function scorePairCandidates(songA, songB, { arc = 'peak', playMode = 'cl
   return {
     bestScore: scored[0]?.score ?? 0.5,
     candidates: scored.slice(0, 5),
+    cueOutCard,
+    cueInCard,
   };
 }
 
@@ -573,26 +726,39 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
   ];
 
   // Clean bass swap: A keeps bass [0..mid], cuts at [mid..len]; B cuts bass [0..mid], slams in at [mid..len]!
+  // Vande Veire & De Bie EQ pattern: also keep only ONE song's treble audible across layered handover!
   let eq_automation = [
     { deck: 'A', band: 'low', points: [[0, 0], [mid - 0.1, 0], [mid, -28], [len, -28]] },
     { deck: 'B', band: 'low', points: [[0, -28], [mid - 0.1, -28], [mid, 0], [len, 0]] },
   ];
+  const incompatibleHarmonics = (cand.key_distance ?? 0) >= 2;
+  if (type === 'bass_swap_blend' || type === 'long_blend') {
+    eq_automation.push(
+      { deck: 'A', band: 'high', points: [[0, 0], [mid - 0.1, -3], [mid, -14], [len, -22]] },
+      { deck: 'B', band: 'high', points: [[0, -14], [mid - 0.1, -10], [mid, 0], [len, 0]] }
+    );
+  }
 
   let filter_automation = [];
   let fx = [];
   let added_drums = null;
   let why = `Matched ${songA.bpm} -> ${songB.bpm} BPM (${cand.bpm_diff_pct}% diff), compatibility ${(cand.score * 100).toFixed(0)}%.`;
 
-  if (type === 'long_blend') {
+  if (type === 'bass_swap_blend') {
+    eq_automation.push({ deck: 'A', band: 'mid', points: [[0, 0], [mid, -1.5], [len, -5]] });
+    filter_automation = [{ deck: 'A', curve: [[0, 0], [mid, 0.14], [len, 0.34]] }];
+  } else if (type === 'long_blend') {
     eq_automation = [
       { deck: 'A', band: 'low', points: [[0, 0], [mid, -18], [len, -28]] },
       { deck: 'B', band: 'low', points: [[0, -28], [mid - 0.5, -24], [mid, 0], [len, 0]] },
+      { deck: 'A', band: 'high', points: [[0, 0], [mid, -12], [len, -22]] },
+      { deck: 'B', band: 'high', points: [[0, -14], [mid - 0.5, -10], [mid, 0], [len, 0]] },
     ];
     stem_layers = [
       { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 1], [mid, 0.15], [len, 0]] },
       { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.05], [mid, 0.95], [len, 1]] },
     ];
-    why = `Compatible Camelot lock & tight BPM -> extended ${len}-bar phrase blend with vocal handoff.`;
+    why = `Compatible Camelot lock & tight <=3 BPM fit -> extended ${len}-bar single-bass/single-treble blend.`;
   } else if (type === 'vocal_mashup' || type === 'acapella_in' || type === 'instrumental_in' || type === 'hook_over_groove') {
     stem_layers = [
       { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.14], [len, 0.02]] },
@@ -662,6 +828,7 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
   } else if (type === 'drum_loop_bridge') {
     const dStyle = (GENRE_PLAYBOOKS[songB.genreKey] || GENRE_PLAYBOOKS.pop).drumStyle;
     added_drums = { style: dStyle, pattern: `${dStyle}_groove`, start_bar: 0, end_bar: len, gain: 0.24 };
+    filter_automation = [{ deck: 'A', curve: [[0, 0], [mid, 0.22], [len, 0.48]] }];
     stem_layers = [
       { song: songA.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.9], [mid, 0.08], [len, 0]] },
       { song: songB.song_id, stem: 'vocals', start_bar: 0, end_bar: len, gain_curve: [[0, 0.02], [mid + 0.5, 0.95], [len, 1]] },
@@ -706,14 +873,29 @@ export function buildRecipeFromCandidate(songA, songB, cand, overrideType = null
     why = `Clean downbeat cut with sub-drop impact on Beat 1.`;
   }
 
+  // Mosaikbox (ISMIR 2024): rule-based removal of incompatible melodic stems when Camelot key clashes (>= 2 steps)
+  if (incompatibleHarmonics && !['echo_out', 'impact_cut', 'spinback', 'stutter_edit', 'loop_roll_drop'].includes(type)) {
+    const hasCustomOtherA = stem_layers.some((s) => s.song === songA.song_id && s.stem === 'other');
+    if (!hasCustomOtherA) {
+      stem_layers.push(
+        { song: songA.song_id, stem: 'other', start_bar: 0, end_bar: len, gain_curve: [[0, 0.72], [mid - 0.5, 0.08], [len, 0]] },
+        { song: songB.song_id, stem: 'other', start_bar: 0, end_bar: len, gain_curve: [[0, 0.06], [mid + 0.5, 0.92], [len, 1]] }
+      );
+    }
+    why = `${why} (Mosaikbox incompatible-stem removal: masked colliding melody across overlap).`;
+  }
+
   const creativeCandidates = generateCreativeIdeas(songA, songB, cand);
   return {
     from: songA.song_id,
     to: songB.song_id,
     mix_out_bar: cand.mix_out_bar,
     mix_in_bar: cand.mix_in_bar,
+    cue_out_reason: cand.cue_out_reason || 'phrase_end',
+    cue_in_reason: cand.cue_in_reason || 'downbeat',
     length_bars: len,
     type,
+    family: getTransitionFamily(type),
     tempo_plan: {
       stretch_from: songB.bpm,
       stretch_to: stretchTo,
@@ -745,6 +927,15 @@ export function validateTransitionRecipe(recipe, songA, songB) {
     return { valid: false, errors: ['Missing song analysis or recipe.'], warnings: [] };
   }
 
+  const hasYtOnly = songA.isDsp === false || songB.isDsp === false;
+  if (hasYtOnly && recipe.type === 'yt_volume_crossfade') {
+    return {
+      valid: true,
+      errors: [],
+      warnings: ['YouTube IFrame deck: volume/cue crossfade only (Web Audio EQ/filters/stems/beatmatch disabled).'],
+    };
+  }
+
   if (!TRANSITION_TYPES.includes(recipe.type)) {
     errors.push(`Unknown transition type "${recipe.type}".`);
   }
@@ -759,13 +950,36 @@ export function validateTransitionRecipe(recipe, songA, songB) {
     errors.push(`Transition window (${len} bars) overflows song bounds.`);
   }
 
-  // Tempo stretch limit check (<= 8.5%, allowing half/double time)
+  // Phrase boundary / downbeat & high-energy exit rules
+  const sectionStartsA = new Set((songA.sections || []).map((s) => s.start_bar));
+  const sectionStartsB = new Set((songB.sections || []).map((s) => s.start_bar));
+  if (songA.bar_count >= 24 && recipe.mix_out_bar % 4 !== 0 && !sectionStartsA.has(recipe.mix_out_bar)) {
+    errors.push(`mix_out_bar (${recipe.mix_out_bar}) is off phrase boundary (expected 4/8/16-bar downbeat or section start).`);
+  }
+  if (songB.bar_count >= 24 && recipe.mix_in_bar % 4 !== 0 && !sectionStartsB.has(recipe.mix_in_bar)) {
+    errors.push(`mix_in_bar (${recipe.mix_in_bar}) enters mid-phrase (must enter on intro, build, chorus, or phrase downbeat).`);
+  }
+  if (songA.bar_count >= 40 && !recipe.allowLateExit && (songA.bar_count - recipe.mix_out_bar) < 12) {
+    errors.push(`mix_out_bar (${recipe.mix_out_bar}) leaves only ${songA.bar_count - recipe.mix_out_bar} bars; must leave outgoing song 16-32 bars before end.`);
+  }
+
+  // Tempo stretch limit check:
+  // - Pro +-3.5 BPM cap for extended long_blend
+  // - <= 8.5% ceiling for other layered blends (allowing half/double time)
   const stretchTo = Number(recipe.tempo_plan?.stretch_to || songA.bpm);
   const fromBpm = Number(recipe.tempo_plan?.stretch_from || songB.bpm);
   if (fromBpm > 0) {
-    const gapDirect = Math.abs(stretchTo - fromBpm) / fromBpm;
-    const gapDouble = Math.abs(stretchTo - fromBpm * 2) / (fromBpm * 2);
-    const gapHalf = Math.abs(stretchTo - fromBpm * 0.5) / (fromBpm * 0.5);
+    const absDirect = Math.abs(stretchTo - fromBpm);
+    const absDouble = Math.abs(stretchTo - fromBpm * 2);
+    const absHalf = Math.abs(stretchTo - fromBpm * 0.5);
+    const minAbsBpm = Math.min(absDirect, absDouble, absHalf);
+    if (recipe.type === 'long_blend' && minAbsBpm > 3.5) {
+      errors.push(`Tempo gap ${minAbsBpm.toFixed(1)} BPM exceeds +-3.5 BPM limit for long_blend (use bass_swap_blend or echo_out).`);
+    }
+
+    const gapDirect = absDirect / fromBpm;
+    const gapDouble = absDouble / (fromBpm * 2);
+    const gapHalf = absHalf / (fromBpm * 0.5);
     const minGap = Math.min(gapDirect, gapDouble, gapHalf);
     if (minGap > 0.085 && !SAFE_TRANSITIONS.has(recipe.type) && recipe.type !== 'build_up_drop' && recipe.type !== 'loop_roll_drop') {
       errors.push(`Tempo stretch ${(minGap * 100).toFixed(1)}% exceeds 8% cap for layered blend.`);
@@ -777,11 +991,19 @@ export function validateTransitionRecipe(recipe, songA, songB) {
     errors.push(`Pitch shift ${semi} semitones exceeds +-2 semitone natural limit.`);
   }
 
-  // Unsafe song check
-  const unsafe = songA.warnings.includes('no_clear_beat') || songB.warnings.includes('no_clear_beat') ||
-                 songA.warnings.includes('variable_tempo') || songB.warnings.includes('variable_tempo');
+  // Unsafe / low-confidence track check
+  const unsafe = Boolean(
+    songA.safe_transitions_only ||
+    songB.safe_transitions_only ||
+    songA.warnings.includes('no_clear_beat') ||
+    songB.warnings.includes('no_clear_beat') ||
+    songA.warnings.includes('variable_tempo') ||
+    songB.warnings.includes('variable_tempo') ||
+    songA.warnings.includes('low_confidence') ||
+    songB.warnings.includes('low_confidence')
+  );
   if (unsafe && !SAFE_TRANSITIONS.has(recipe.type)) {
-    errors.push(`Track warnings require safe transition, got "${recipe.type}".`);
+    errors.push(`Track warnings / low_confidence require safe transition, got "${recipe.type}".`);
   }
 
   // Sample 5 checkpoints across overlap [0 .. len] for Bass Clash, Vocal Clash, and Harmonic Key rule
@@ -801,13 +1023,24 @@ export function validateTransitionRecipe(recipe, songA, songB) {
   };
 
   const getLowGain01 = (deckChar, barOff) => {
+    const songId = deckChar === 'A' ? songA.song_id : songB.song_id;
     const eq = (recipe.eq_automation || []).find((e) => e.deck === deckChar && e.band === 'low');
     if (eq?.points?.length) {
       const db = sampleGain(eq.points, barOff, 0);
-      return db <= -12 ? 0.1 : 1.0;
+      if (db <= -12) return 0.1;
     }
-    const allLayer = (recipe.stem_layers || []).find((s) => s.song === (deckChar === 'A' ? songA.song_id : songB.song_id) && s.stem === 'all');
-    if (allLayer?.gain_curve?.length) return sampleGain(allLayer.gain_curve, barOff, 0.5);
+    const layers = (recipe.stem_layers || []).filter((s) => s.song === songId);
+    const bassLayer = layers.find((s) => s.stem === 'bass');
+    const allLayer = layers.find((s) => s.stem === 'all');
+    const chosen = bassLayer || allLayer;
+    if (chosen) {
+      const start = Number.isFinite(chosen.start_bar) ? chosen.start_bar : 0;
+      const end = Number.isFinite(chosen.end_bar) ? chosen.end_bar : len;
+      if (barOff < start || barOff > end) return 0.0;
+      if (chosen.gain_curve?.length) return sampleGain(chosen.gain_curve, barOff, 0.5);
+      return 1.0;
+    }
+    if (eq?.points?.length) return 1.0;
     return deckChar === 'A' ? (barOff < len * 0.5 ? 1 : 0.1) : (barOff >= len * 0.5 ? 1 : 0.1);
   };
 
@@ -847,23 +1080,13 @@ export function validateTransitionRecipe(recipe, songA, songB) {
   }
 
   // Protected lyric ranges check ("do not cut through" crucial sung phrases)
-  const outSec = songA.bars?.[recipe.mix_out_bar]?.start_sec;
-  if (Number.isFinite(outSec)) {
-    for (const r of songA.lyric_understanding?.do_not_cut_ranges || []) {
-      if (outSec > Number(r.start_sec) + 0.8 && outSec < Number(r.end_sec) - 0.8) {
-        errors.push(`Mix-out at ${outSec.toFixed(1)}s cuts through protected lyric phrase (${r.reason || 'hook'}).`);
-        break;
-      }
-    }
+  const hitA = findProtectedRangeOverlap(songA, recipe.mix_out_bar, len);
+  if (hitA) {
+    errors.push(`Mix-out window (${hitA.winStart.toFixed(1)}s-${hitA.winEnd.toFixed(1)}s) cuts through protected lyric phrase (${hitA.reason || 'hook'}).`);
   }
-  const inSec = songB.bars?.[recipe.mix_in_bar]?.start_sec;
-  if (Number.isFinite(inSec)) {
-    for (const r of songB.lyric_understanding?.do_not_cut_ranges || []) {
-      if (inSec > Number(r.start_sec) + 0.8 && inSec < Number(r.end_sec) - 0.8) {
-        errors.push(`Mix-in at ${inSec.toFixed(1)}s lands inside protected lyric phrase (${r.reason || 'hook'}).`);
-        break;
-      }
-    }
+  const hitB = findProtectedRangeOverlap(songB, recipe.mix_in_bar, len);
+  if (hitB) {
+    errors.push(`Mix-in window (${hitB.winStart.toFixed(1)}s-${hitB.winEnd.toFixed(1)}s) lands inside protected lyric phrase (${hitB.reason || 'hook'}).`);
   }
 
   // Clipping headroom guard across full-mix overlaps
@@ -930,7 +1153,112 @@ export function validateSetPlan(plan, songsMap) {
 }
 
 /**
- * PHASE 2 BUILT-IN PLANNER (Running Order TSP + Top 5 Pair Scoring + Validated Recipes)
+ * 9 DJustify + Pro DJ Acoustic Checker Gates:
+ * Evaluates rendered audio metrics + recipe structure and produces exact, actionable repair instructions
+ * for the Critic repair loop (up to 4 iterations).
+ */
+export const CHECKER_GATES = [
+  { id: 'vocal_integrity', label: 'Vocal Cut Integrity', fix: 'Move mix_out_bar / mix_in_bar past protected phrase end' },
+  { id: 'vocal_clash', label: 'Vocal Collision', fix: 'Shorten overlap, mute one vocal stem (<=0.12), or cut' },
+  { id: 'energy_hole', label: 'Energy / Silent Gap', fix: 'Eliminate silent gap: tighten overlap or switch to rolling/build_up_drop' },
+  { id: 'structure_intro_trap', label: 'Structure (Intro Trap)', fix: 'Entry stuck in flat incoming intro — re-cue mix_in_bar to verse or chorus' },
+  { id: 'pairing_mismatch', label: 'Pairing / Tempo Jump', fix: 'Tempo or mood jump too large — switch to echo_out, build_up_drop, or re-order' },
+  { id: 'beat_phase', label: 'Beat Phase Lock', fix: 'Onsets misaligned in overlap — re-align by cross-correlation or switch to echo_out' },
+  { id: 'bass_overlap', label: 'Single Bassline', fix: 'Two kicks/basslines overlap — force strict low EQ <= -24dB bass swap at midpoint' },
+  { id: 'loudness_clip', label: 'Loudness & Headroom', fix: 'Clipping or LUFS jump detected — apply -1.5dB gain trim & balance deck trim' },
+  { id: 'key_clash', label: 'Harmonic Key Fit', fix: 'Key clash during overlap — pitch-shift <= +-2st, remove melodic stems, or use filter_sweep' },
+];
+
+export function evaluateCheckerGates(metrics = {}, recipe = null, songA = null, songB = null) {
+  const gates = {};
+  const failed_gates = [];
+  const repair_instructions = [];
+  const mark = (id, pass, detail) => {
+    gates[id] = { pass: Boolean(pass), detail };
+    if (!pass) {
+      const def = CHECKER_GATES.find((g) => g.id === id);
+      failed_gates.push({ id, label: def?.label || id, detail, fix: def?.fix || detail });
+      repair_instructions.push(`[${id.toUpperCase()}] ${detail} -> FIX: ${def?.fix || 'adjust recipe'}`);
+    }
+  };
+
+  const len = Math.max(1, Number(recipe?.length_bars) || 8);
+  const a = songA ? normalizeSongAnalysis(songA) : null;
+  const b = songB ? normalizeSongAnalysis(songB) : null;
+
+  // 1. Vocal mid-phrase cut
+  const hitA = a && recipe ? findProtectedRangeOverlap(a, recipe.mix_out_bar, len) : null;
+  const hitB = b && recipe ? findProtectedRangeOverlap(b, recipe.mix_in_bar, len) : null;
+  mark('vocal_integrity', !hitA && !hitB, hitA ? `Mix-out cuts "${hitA.reason}"` : hitB ? `Mix-in lands inside "${hitB.reason}"` : 'Clean phrase cut');
+
+  // 2. Vocal collision
+  const vocOverlap = Number(metrics.vocal_overlap_pct) || 0;
+  mark('vocal_clash', vocOverlap <= 38, vocOverlap > 38 ? `Vocal overlap ${vocOverlap}% (>38%)` : `Vocal overlap ${vocOverlap}%`);
+
+  // 3. Energy hole / silent gap
+  const holePct = Number(metrics.energy_hole_pct) || 0;
+  const minDip = Number(metrics.min_rms_dip_db) || 0;
+  mark('energy_hole', holePct <= 24 && minDip >= -18, (holePct > 24 || minDip < -18) ? `Energy hole ${holePct}% / dip ${minDip}dB` : `Flow intact (min ${minDip}dB)`);
+
+  // 4. Structure: entry stuck in flat incoming intro
+  let introTrap = false;
+  if (b && recipe) {
+    const inSec = barSectionAt(b, recipe.mix_in_bar || 0);
+    const hasBetterCue = b.sections.some((s) => (s.type === 'verse' || s.type === 'chorus' || s.type === 'drop') && s.start_bar < b.bar_count - 12);
+    if (inSec.type === 'intro' && (inSec.energy ?? 0.5) < 0.36 && (recipe.mix_in_bar || 0) === 0 && hasBetterCue && b.bar_count >= 36 && !SAFE_TRANSITIONS.has(recipe.type) && len < 8) {
+      introTrap = true;
+    }
+  }
+  mark('structure_intro_trap', !introTrap, introTrap ? 'Entry stuck in low-energy bar-0 intro during quick cut' : 'Incoming structure OK');
+
+  // 5. Pairing / tempo mismatch
+  const tempoPct = a && b && recipe?.tempo_plan?.stretch_from
+    ? (Math.abs((recipe.tempo_plan.stretch_to || a.bpm) - recipe.tempo_plan.stretch_from) / Math.max(55, recipe.tempo_plan.stretch_from)) * 100
+    : (recipe?.compatibility?.bpm_diff_pct ?? 0);
+  const tempoOctaveOk = a && b ? computeTempoFit(a.bpm, b.bpm).diffPct <= 8.5 : tempoPct <= 8.5;
+  const pairingFail = recipe && !tempoOctaveOk && !SAFE_TRANSITIONS.has(recipe.type) && recipe.type !== 'build_up_drop' && recipe.type !== 'loop_roll_drop';
+  mark('pairing_mismatch', !pairingFail, pairingFail ? `Tempo diff exceeds 8.5% without safe cut (${recipe.type})` : 'Tempo/pairing OK');
+
+  // 6. Beat phase misalignment (onset jitter + cross-correlation phase shift)
+  const driftMs = Number(metrics.beat_drift_ms) || 0;
+  const phaseLagMs = Math.abs(Number(metrics.onset_phase_offset_ms) || 0);
+  mark('beat_phase', driftMs <= 28 && phaseLagMs <= 26, (driftMs > 28 || phaseLagMs > 26) ? `Beat drift ${driftMs}ms / phase offset ${phaseLagMs}ms` : `Tight beat lock (${driftMs}ms drift)`);
+
+  // 7. Bass overlap
+  const bassPct = Number(metrics.bass_overlap_pct) || 0;
+  mark('bass_overlap', bassPct <= 32, bassPct > 32 ? `Sub-bass overlap ${bassPct}% (>32%)` : `Bass overlap ${bassPct}%`);
+
+  // 8. Loudness & clipping
+  const clips = Number(metrics.clipping_samples) || 0;
+  const lufsJump = Math.abs(Number(metrics.lufs_jump_db) || 0);
+  mark('loudness_clip', clips === 0 && lufsJump <= 6.5, (clips > 0 || lufsJump > 6.5) ? `Clip=${clips} samples, LUFS jump=${lufsJump}dB` : `Headroom clean (${clips} clips, ${lufsJump}dB jump)`);
+
+  // 9. Key clash with active melodic stems
+  let keyClash = false;
+  let keyDist = 0;
+  if (a?.key_camelot && b?.key_camelot && recipe) {
+    const semi = Number(recipe.tempo_plan?.pitch_shift_semitones || 0);
+    keyDist = camelotDistance(a.key_camelot, shiftCamelot(b.key_camelot, semi));
+    const melodicLayers = (recipe.stem_layers || []).some((s) => s.stem === 'vocals' || s.stem === 'other');
+    if (keyDist >= 2 && (recipe.type === 'long_blend' || recipe.type === 'vocal_mashup' || recipe.type === 'hook_over_groove') && melodicLayers) {
+      keyClash = true;
+    }
+  }
+  mark('key_clash', !keyClash, keyClash ? `Camelot distance ${keyDist} in melodic blend "${recipe?.type}"` : 'Harmonic compatibility OK');
+
+  return {
+    passed: failed_gates.length === 0,
+    total_gates: CHECKER_GATES.length,
+    passed_count: CHECKER_GATES.length - failed_gates.length,
+    failed_gates,
+    repair_instructions,
+    gates,
+  };
+}
+
+/**
+ * PHASE 2 BUILT-IN PLANNER (Running Order TSP + Top 5 Pair Scoring + Validated Recipes
+ * + Vande Veire State Machine + Mosaikbox Set-Level Emotional Arc)
  */
 export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moodEnergy = null } = {}) {
   const analyses = tracks.map((t) => normalizeSongAnalysis(t));
@@ -951,9 +1279,18 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
     };
   }
 
-  // Greedy TSP / Beam ordering maximize pair compatibility + energy arc + avoid back-to-back artists
+  // Greedy TSP / Beam ordering: acoustic pair fit + Mosaikbox set-level emotional arc placement + avoid back-to-back artists
   const pool = [...analyses];
   const avgEnergy = (a) => a.energy_per_bar.reduce((x, y) => x + y, 0) / Math.max(1, a.energy_per_bar.length);
+  const moodArcFit = (song, idxFrac) => {
+    const moodTxt = String(song.lyric_understanding?.mood || song.tags?.mood || '').toLowerCase();
+    const highMood = /euphoric|hype|party|energetic|banger|aggressive/.test(moodTxt);
+    const chillMood = /chill|tender|romantic|sad|melancholic|ambient/.test(moodTxt);
+    if (vibe === 'warmup') return idxFrac > 0.6 && highMood ? 0.04 : idxFrac < 0.3 && chillMood ? 0.04 : 0;
+    if (vibe === 'winddown') return idxFrac > 0.5 && chillMood ? 0.05 : 0;
+    return 0;
+  };
+
   let startIdx = 0;
   if (vibe === 'warmup') {
     startIdx = pool.reduce((b, x, i) => (avgEnergy(x) < avgEnergy(pool[b]) ? i : b), 0);
@@ -964,12 +1301,13 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
   const ordered = [pool.splice(startIdx, 1)[0]];
   while (pool.length) {
     const prev = ordered[ordered.length - 1];
+    const progressFrac = ordered.length / Math.max(1, analyses.length - 1);
     let bestIdx = 0;
     let bestVal = -Infinity;
     for (let i = 0; i < pool.length; i++) {
       const cand = pool[i];
       const { bestScore } = scorePairCandidates(prev, cand, { arc: vibe, playMode, moodEnergy });
-      let adj = bestScore;
+      let adj = bestScore + moodArcFit(cand, progressFrac);
       const a1 = String(prev.artist || '').toLowerCase().split(/[,&]/)[0].trim();
       const a2 = String(cand.artist || '').toLowerCase().split(/[,&]/)[0].trim();
       if (a1 && a2 && a1 === a2) adj -= 0.25;
@@ -984,10 +1322,40 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
   const transitions = [];
   let tempoSmoothSum = 0;
   let vocalClashTotal = 0;
+  let prevFamily = null;
   for (let i = 0; i < ordered.length - 1; i++) {
     const songA = ordered[i];
     const songB = ordered[i + 1];
-    const { candidates } = scorePairCandidates(songA, songB, { arc: vibe, playMode, moodEnergy });
+    if (songA.isDsp === false || songB.isDsp === false) {
+      const lenBars = 4;
+      const outBar = Math.max(2, songA.bar_count - 4);
+      const ytRec = {
+        from: songA.song_id,
+        to: songB.song_id,
+        mix_out_bar: outBar,
+        mix_in_bar: 0,
+        length_bars: lenBars,
+        type: 'yt_volume_crossfade',
+        ytOnly: true,
+        tempo_plan: { stretch_from: songB.bpm, stretch_to: songB.bpm, pitch_shift_semitones: 0 },
+        stem_layers: [],
+        eq_automation: [],
+        filter_automation: [],
+        fx: [],
+        added_drums: null,
+        why: 'YT VIDEO MODE (NO DSP): Discrete cue seek & equal-power volume crossfade only (Web Audio EQ/stems/stretch blocked by browser iframe policy).',
+        risk: 'medium',
+        fallback: 'yt_volume_crossfade',
+        compatibility: { score: 0.55, bpm_diff_pct: 0, unsafe: false, breakdown: { T: 0.5, K: 0.5, E: 0.6, P: 0.6, V: 0.5, G: 0.5, R: 0 } },
+      };
+      ytRec.validation = validateTransitionRecipe(ytRec, songA, songB);
+      transitions.push(ytRec);
+      tempoSmoothSum += 0.5;
+      vocalClashTotal += 1;
+      continue;
+    }
+    // Vande Veire & De Bie state machine: pass prevFamily so identical transition types never repeat consecutively
+    const { candidates } = scorePairCandidates(songA, songB, { arc: vibe, playMode, moodEnergy, prevFamily });
     let recipe = buildRecipeFromCandidate(songA, songB, candidates[0]);
     const v = validateTransitionRecipe(recipe, songA, songB);
     if (!v.valid) {
@@ -996,6 +1364,7 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
       recipe.validation = v;
     }
     recipe.candidates = candidates;
+    prevFamily = getTransitionFamily(recipe.type);
     transitions.push(recipe);
     tempoSmoothSum += (candidates[0]?.breakdown?.T ?? 0.8);
     vocalClashTotal += (v.warnings?.length ? 1 : 0);
@@ -1008,7 +1377,7 @@ export function planSetHeuristic(tracks, { vibe = 'peak', playMode = 'club', moo
     energy_plan: vibe,
     analyses: ordered,
     transitions,
-    plannerSource: 'NOVA Pair-Compatibility + Rule Validator',
+    plannerSource: 'NOVA DJustify + Vande Veire + Rule Validator',
   };
   plan.validation = validateSetPlan(plan, map);
   plan.quality = {

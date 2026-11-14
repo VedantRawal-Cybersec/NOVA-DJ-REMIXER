@@ -150,6 +150,7 @@ export function createStemChannelStrip(ctx, destination) {
     eqLow: 0,
     eqMid: 0,
     eqHigh: 0,
+    kills: { low: false, mid: false, high: false },
   };
 
   function setNeuralMode(enabled, atTime = ctx.currentTime) {
@@ -194,14 +195,25 @@ export function createStemChannelStrip(ctx, destination) {
   }
 
   function setEqBand(band, dbValue, atTime = ctx.currentTime, rampSec = 0.03) {
-    const clamped = Math.max(-36, Math.min(6, Number(dbValue) || 0));
+    const clamped = Math.max(-42, Math.min(6, Number(dbValue) || 0));
     const node = band === 'low' ? eqLow : band === 'mid' ? eqMid : eqHigh;
     const tc = Math.max(0.012, rampSec);
     if (band === 'low') state.eqLow = clamped;
     else if (band === 'mid') state.eqMid = clamped;
     else state.eqHigh = clamped;
     node.gain.cancelScheduledValues(atTime);
-    node.gain.setTargetAtTime(clamped, atTime, tc);
+    const effective = state.kills[band] ? -42 : clamped;
+    node.gain.setTargetAtTime(effective, atTime, tc);
+  }
+
+  function setEqKill(band, killed, atTime = ctx.currentTime) {
+    if (!(band in state.kills)) return false;
+    state.kills[band] = Boolean(killed);
+    const node = band === 'low' ? eqLow : band === 'mid' ? eqMid : eqHigh;
+    const saved = band === 'low' ? state.eqLow : band === 'mid' ? state.eqMid : state.eqHigh;
+    node.gain.cancelScheduledValues(atTime);
+    node.gain.setTargetAtTime(state.kills[band] ? -42 : saved, atTime, 0.012);
+    return state.kills[band];
   }
 
   function setColorFilter(norm, atTime = ctx.currentTime, rampSec = 0.03) {
@@ -240,6 +252,9 @@ export function createStemChannelStrip(ctx, destination) {
     setStem('drums', 1, atTime, 0.04);
     setStem('vocals', 1, atTime, 0.04);
     setStem('other', 1, atTime, 0.04);
+    state.kills.low = false;
+    state.kills.mid = false;
+    state.kills.high = false;
     setEqBand('low', 0, atTime, 0.04);
     setEqBand('mid', 0, atTime, 0.04);
     setEqBand('high', 0, atTime, 0.04);
@@ -268,6 +283,7 @@ export function createStemChannelStrip(ctx, destination) {
     setNeuralMode,
     setStem,
     setEqBand,
+    setEqKill,
     setColorFilter,
     resetAll,
   };

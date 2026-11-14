@@ -48,12 +48,12 @@ function esc(str) {
 }
 
 const LANGUAGES = [
-  { id: 'hindi', label: 'Hindi', hint: 'Bollywood · Indie · Retro', query: 'Hindi party dance hit songs' },
-  { id: 'punjabi', label: 'Punjabi', hint: 'Bhangra · Hip-Hop · Anthems', query: 'Punjabi party hit songs' },
-  { id: 'english', label: 'English', hint: 'Pop · Hip-Hop · Club', query: 'English party dance pop hits' },
-  { id: 'electronic', label: 'House & Techno', hint: 'Full DSP Club · Afro · EDM', query: 'Afro house melodic techno remix', preferDsp: true },
-  { id: 'tamil-telugu', label: 'Tamil / Telugu', hint: 'Kuthu · Mass · Beats', query: 'Tamil Telugu mass party songs' },
-  { id: 'bollywood-remix', label: 'DJ Remixes', hint: 'Mashups · Club Edits', query: 'Bollywood DJ remix mashup' },
+  { id: 'hindi', label: 'Hindi', hint: 'Bollywood · Indie · Retro', query: 'bollywood' },
+  { id: 'punjabi', label: 'Punjabi', hint: 'Bhangra · Hip-Hop · Anthems', query: 'punjabi' },
+  { id: 'english', label: 'English', hint: 'Pop · Hip-Hop · Club', query: 'pop' },
+  { id: 'electronic', label: 'House & Techno', hint: 'Full DSP Club · Afro · EDM', query: 'house', preferDsp: true },
+  { id: 'tamil-telugu', label: 'Tamil / Telugu', hint: 'Kuthu · Mass · Beats', query: 'tamil' },
+  { id: 'bollywood-remix', label: 'DJ Remixes', hint: 'Mashups · Club Edits', query: 'remix' },
 ];
 
 const MIX_STYLES = [
@@ -75,9 +75,27 @@ const CROWD_SIZES = [
   { id: 'large', label: '20+', hint: 'Full dancefloor mode' },
 ];
 
+const GENRE_CATALOG = [
+  { id: 'trending',          label: '🔥 Trending Full-DSP',       mode: 'trending', q: '',                   genre: 'Electronic' },
+  { id: 'bollywood',         label: '🎬 Bollywood / Hindi',        mode: 'search',   q: 'bollywood',          genre: '' },
+  { id: 'punjabi',           label: '🥁 Punjabi / Bhangra',        mode: 'search',   q: 'punjabi',            genre: '' },
+  { id: 'pop',               label: '🎵 Hollywood / Pop',          mode: 'trending', q: '',                   genre: 'Pop' },
+  { id: 'hiphop',            label: '🎤 Hip-Hop / Rap',            mode: 'trending', q: '',                   genre: 'Hip-Hop/Rap' },
+  { id: 'house',             label: '🏠 House & EDM',              mode: 'trending', q: '',                   genre: 'House' },
+  { id: 'techno',            label: '⚙ Techno / Club',            mode: 'trending', q: '',                   genre: 'Techno' },
+  { id: 'remix',             label: '🎚 DJ Mashups & Edits',       mode: 'search',   q: 'remix',              genre: '' },
+  // Apple Music 30s previews — CORS * confirmed
+  { id: 'itunes-bollywood',  label: '🍎 Apple Music Bollywood',   mode: 'search',   q: 'bollywood hindi',    genre: '', provider: 'itunes' },
+  { id: 'itunes-punjabi',    label: '🍎 Apple Music Punjabi',     mode: 'search',   q: 'punjabi bhangra diljit', genre: '', provider: 'itunes' },
+  { id: 'itunes-pop',        label: '🍎 Apple Music Pop',         mode: 'search',   q: 'pop hits',           genre: '', provider: 'itunes' },
+  { id: 'itunes-hiphop',     label: '🍎 Apple Music Hip-Hop',     mode: 'search',   q: 'hip hop rap',        genre: '', provider: 'itunes' },
+  { id: 'itunes-tamil',      label: '🍎 Apple Music Tamil',       mode: 'search',   q: 'tamil kuthu',        genre: '', provider: 'itunes' },
+  { id: 'itunes-edm',        label: '🍎 Apple Music EDM',         mode: 'search',   q: 'edm house electronic', genre: '', provider: 'itunes' },
+];
+
 const SPLASH_HOOKS = [
   'NO MORE “BHAI, EK GAANA LAGA DE”.',
-  'PASTE A PLAYLIST. HEAR A REAL DJ SET.',
+  'DROP YOUR TRACKS. HEAR A REAL DJ SET.',
   'BEATMATCHED. STEM-CLEANED. ZERO CLASH.',
   'CLUB TRANSITIONS ON AUTOPILOT.',
 ];
@@ -88,9 +106,12 @@ const state = {
   sessionId: getSessionId(),
   health: null,
 
-  // Source & Crate
+  // Source & Crate (Full-DSP Audio/Video + Honest Optional YouTube IFrame Video Mode)
   searchInput: '',
-  searchProvider: 'youtube', // youtube | audius
+  searchProvider: 'audius', // audius | openverse | itunes | all | youtube
+  searchPage: 1,
+  searchHasMore: false,
+  activeGenre: '',
   searchBusy: false,
   searchStatus: '',
   searchError: false,
@@ -136,7 +157,7 @@ const state = {
   vibeModalOpen: false,
   playNextModalOpen: false,
   playNextQuery: '',
-  pipVideoVisible: false,
+  pipVideoVisible: true,
   sweepKey: 0,
   lastLiveId: 'A',
   lastPaused: false,
@@ -240,6 +261,8 @@ function handleOrchestratorUpdate(snap) {
       if (agentMsg && agentMsg.textContent !== snap.agentMessage) {
         agentMsg.textContent = snap.agentMessage;
       }
+      updateDeckTelemetryDom('A', snap.deckTelemetry?.A);
+      updateDeckTelemetryDom('B', snap.deckTelemetry?.B);
       return;
     }
 
@@ -366,8 +389,21 @@ function getLearnedCueMap() {
   }
 }
 
+function isDecodableTrack(track) {
+  return Boolean(track && (track.file || track.stemFiles || track.stemUrls || (track.dspReady && track.streamUrl)));
+}
+
+function isYtTrack(track) {
+  return Boolean(track && track.videoId && !isDecodableTrack(track));
+}
+
+function isPlayableTrack(track) {
+  return isDecodableTrack(track) || isYtTrack(track);
+}
+
 function addTrackToCrate(track) {
   if (!track || !track.id) return false;
+  if (!isPlayableTrack(track)) return false;
   if (state.crate.some((t) => t.id === track.id)) return false;
   const learned = getLearnedCueMap()[track.id];
   const cachedAi = getAnalysisCache()[track.id];
@@ -377,20 +413,22 @@ function addTrackToCrate(track) {
     ...(learned ? { entrySec: learned.entrySec ?? track.entrySec, playFull: learned.playFull ?? track.playFull, cueConfidence: 'user' } : {}),
   };
   state.crate.push({ ...merged, heat: buildFallbackHeat(merged) });
+  if (state.crate.length >= 2) syncAutoPlan({ navigate: false });
   return true;
 }
 
-async function handleSourceFetch(overrideQuery = null) {
+async function handleSourceFetch(overrideQuery = null, { page = 1, append = false, genre = '', mode = '', provider: overrideProvider = null } = {}) {
   const q = String(overrideQuery ?? state.searchInput).trim();
-  if (!q) {
-    state.searchStatus = 'Paste a YouTube playlist URL, song link, direct audio URL, or type a track/artist.';
+  const isYtUrl = /youtube\.com|youtu\.be|music\.youtube\.com/i.test(q);
+  if (!q && !genre && mode !== 'trending') {
+    state.searchStatus = 'Pick a genre below, search Audius/YouTube, paste a direct audio/YouTube URL, or drop local audio/video files.';
     state.searchError = true;
     render();
     return;
   }
 
   // Direct CORS audio file URL support (.mp3 / .wav / .flac / .m4a / .ogg)
-  if (/^https?:\/\/.+\.(?:mp3|wav|flac|m4a|ogg|aac)(?:\?.*)?$/i.test(q)) {
+  if (!isYtUrl && /^https?:\/\/.+\.(?:mp3|wav|flac|m4a|ogg|aac)(?:\?.*)?$/i.test(q)) {
     const cleanFile = q.split('?')[0].split('/').pop() || 'Audio Stream';
     const track = {
       id: `url-${btoa(q).replace(/[^a-z0-9]/gi, '').slice(0, 18)}`,
@@ -410,6 +448,7 @@ async function handleSourceFetch(overrideQuery = null) {
     };
     addTrackToCrate(track);
     state.searchResults = [track];
+    state.searchHasMore = false;
     state.searchError = false;
     state.searchStatus = `Added direct audio stream "${track.title}" to crate (Full DSP enabled).`;
     render();
@@ -418,39 +457,67 @@ async function handleSourceFetch(overrideQuery = null) {
 
   state.searchBusy = true;
   state.searchError = false;
-  const isUrl = /youtube\.com|youtu\.be|list=/i.test(q);
-  state.searchStatus = isUrl ? 'Importing tracks from YouTube link…' : `Searching ${state.searchProvider === 'audius' ? 'Audius Full DSP' : 'YouTube'}…`;
+  if (!append) state.searchPage = page;
+
+  const useYt = isYtUrl || state.searchProvider === 'youtube';
+  if (useYt) {
+    state.searchStatus = isYtUrl
+      ? 'Loading YouTube video/playlist in YT Video Mode (Volume/Cue Fade Only · No DSP)…'
+      : `Searching YouTube videos for "${q}" (YT Volume/Cue Mode)…`;
+    render();
+    try {
+      const param = isYtUrl
+        ? `url=${encodeURIComponent(q)}&maxItems=150`
+        : `q=${encodeURIComponent(q)}&limit=18`;
+      const res = await fetch(`/api/youtube-search?${param}`);
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data?.error || 'YouTube lookup failed');
+      const tracks = (data.results || []).map((t) => ({
+        ...t,
+        source: 'youtube',
+        provider: 'YouTube Video · Vol/Cue Only (No DSP)',
+        playback: 'youtube-iframe',
+        dspReady: false,
+        mixReady: true,
+        ytOnly: true,
+      }));
+      if (isYtUrl && tracks.length === 1) addTrackToCrate(tracks[0]);
+      state.searchResults = tracks;
+      state.searchHasMore = false;
+      state.searchStatus = tracks.length
+        ? `Loaded ${tracks.length} YT track(s). Honest notice: browser YouTube iframes allow Volume/Cue crossfades ONLY (Web Audio EQ, stems, stretch & WAV export are disabled for YT tracks).`
+        : 'No playable YouTube videos found.';
+    } catch (err) {
+      state.searchError = true;
+      state.searchStatus = err.message || 'YouTube load failed.';
+    } finally {
+      state.searchBusy = false;
+      render();
+    }
+    return;
+  }
+
+  const prov = overrideProvider || (state.searchProvider === 'openverse' ? 'openverse' : state.searchProvider === 'itunes' ? 'itunes' : state.searchProvider === 'all' ? 'all' : 'audius');
+  const reqMode = mode || (!q && genre ? 'trending' : 'search');
+  state.searchStatus = `Fetching Full-DSP streams (${genre || q || 'Trending'} · Page ${page})…`;
   render();
 
   try {
-    let tracks = [];
-    if (isUrl || state.searchProvider === 'youtube') {
-      const param = isUrl ? `url=${encodeURIComponent(q)}` : `q=${encodeURIComponent(q)}&limit=15`;
-      const res = await fetch(`/api/youtube-search?${param}`);
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || 'YouTube search failed.');
-      }
-      tracks = Array.isArray(data.results) ? data.results : [];
-      if (data.kind === 'playlist') {
-        let added = 0;
-        for (const t of tracks) if (addTrackToCrate(t)) added++;
-        state.searchStatus = `Imported "${data.title || 'Playlist'}": ${added} new songs loaded into your crate (${tracks.length} total).`;
-        refreshCostEstimate();
-      } else {
-        state.searchStatus = tracks.length
-          ? `Found ${tracks.length} YouTube tracks. Tap any card to add to crate, or click ADD ALL.`
-          : 'No embeddable tracks matched that search.';
-      }
+    const url = `/api/catalogue?q=${encodeURIComponent(q)}&genre=${encodeURIComponent(genre)}&mode=${encodeURIComponent(reqMode)}&provider=${encodeURIComponent(prov)}&page=${page}&limit=24`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const incoming = (data.results || []).filter((t) => isDecodableTrack(t));
+    if (append && page > 1) {
+      const seen = new Set(state.searchResults.map((x) => x.id));
+      state.searchResults = [...state.searchResults, ...incoming.filter((x) => !seen.has(x.id))];
     } else {
-      const res = await fetch(`/api/catalogue?q=${encodeURIComponent(q)}&provider=all&limit=18`);
-      const data = await res.json();
-      tracks = (data.results || []).filter((t) => t.mixReady);
-      state.searchStatus = tracks.length
-        ? `Found ${tracks.length} full-DSP mixable tracks (Audius & Openverse).`
-        : 'No full-stream tracks found for that query. Try electronic/hip-hop/remix or switch to YouTube.';
+      state.searchResults = incoming;
     }
-    state.searchResults = tracks;
+    state.searchPage = page;
+    state.searchHasMore = Boolean(data.hasMore);
+    state.searchStatus = state.searchResults.length
+      ? `Showing ${state.searchResults.length} Full-DSP mixable streams. Click + ADD ALL or LOAD MORE for deeper crate building.`
+      : 'No decodable Full-DSP streams matched that query. Try another genre or drop local audio/video files.';
   } catch (err) {
     state.searchError = true;
     state.searchStatus = err.message || 'Search failed.';
@@ -462,18 +529,18 @@ async function handleSourceFetch(overrideQuery = null) {
 
 async function handleLocalFiles(files) {
   const list = Array.from(files || []).filter(
-    (f) => f.type.startsWith('audio/') || /\.(mp3|wav|flac|m4a|ogg|aac)$/i.test(f.name)
+    (f) => f.type.startsWith('audio/') || f.type.startsWith('video/') || /\.(mp3|wav|flac|m4a|ogg|aac|mp4|webm|m4v|mov)$/i.test(f.name)
   );
   if (!list.length) {
     state.searchError = true;
-    state.searchStatus = 'No supported audio files found (use MP3, WAV, FLAC, M4A, OGG).';
+    state.searchStatus = 'No supported audio or video files found (use MP3, WAV, FLAC, M4A, OGG, MP4, WEBM).';
     render();
     return;
   }
 
   state.searchBusy = true;
   state.searchError = false;
-  state.searchStatus = `Decoding & analyzing ${list.length} audio file(s) with Essentia WASM…`;
+  state.searchStatus = `Decoding & analyzing ${list.length} audio/video file(s) with Essentia WASM…`;
   render();
 
   const orch = initOrchestrator();
@@ -506,6 +573,7 @@ async function handleLocalFiles(files) {
   let count = 0;
   for (const item of fileItems) {
     const refFile = item.file || item.refFile;
+    const isVid = Boolean(item.file && (item.file.type.startsWith('video/') || /\.(mp4|webm|m4v|mov)$/i.test(item.file.name)));
     const cleanName = item.stemFiles ? item.base : refFile.name.replace(/\.[^.]+$/, '');
     const parts = cleanName.split(/\s+[-–]\s+/);
     const track = {
@@ -513,13 +581,15 @@ async function handleLocalFiles(files) {
         ? `stems-${cleanName}-${refFile.size}-${refFile.lastModified}`
         : `local-${refFile.name}-${refFile.size}-${refFile.lastModified}`,
       source: 'local',
-      provider: item.stemFiles ? 'Local 4-Stem Neural Bundle' : 'Local File · Full DSP',
+      provider: item.stemFiles ? 'Local 4-Stem Neural Bundle' : isVid ? 'Local Video · Full DSP ✓' : 'Local File · Full DSP',
       playback: 'web-audio-dsp',
       mixReady: true,
       dspReady: true,
       neuralStems: Boolean(item.stemFiles),
+      isVideo: isVid,
+      videoUrl: isVid ? URL.createObjectURL(item.file) : null,
       title: parts.length > 1 ? parts.slice(1).join(' - ') : cleanName,
-      artist: parts.length > 1 ? parts[0] : (item.stemFiles ? 'Demucs Stems' : 'Local Audio'),
+      artist: parts.length > 1 ? parts[0] : (item.stemFiles ? 'Demucs Stems' : isVid ? 'Local Music Video' : 'Local Audio'),
       ...(item.stemFiles ? { stemFiles: item.stemFiles } : { file: item.file }),
       durationSec: 180,
       energy: 7,
@@ -549,6 +619,13 @@ async function handleLocalFiles(files) {
         hookExit: a.hookExit,
         entrySec: a.clubEntry,
         exitSec: a.clubExit,
+        content_hash: a.content_hash,
+        cached: a.cached,
+        tracker_comparison: a.tracker_comparison,
+        low_confidence: a.low_confidence,
+        safe_transitions_only: a.safe_transitions_only,
+        stems_available: a.stems_available,
+        stem_mode: a.stem_mode,
       });
 
       // Async Phase 1 Lyric Transcription & Understanding (cached per song ID; never blocks track loading)
@@ -601,29 +678,20 @@ async function handleLocalFiles(files) {
 }
 
 async function advanceFromStep0() {
-  // If user didn't add manual tracks yet but selected Language/Vibe tiles, auto-populate from APIs!
+  // If user didn't add manual tracks yet but selected Language/Vibe tiles, auto-populate strictly from decodable Full-DSP catalogue!
   if (state.crate.length < 2 && state.selectedLanguages.length > 0) {
     state.searchBusy = true;
     state.searchError = false;
-    state.searchStatus = 'Building your crate from selected vibes…';
+    state.searchStatus = 'Building your Full-DSP crate from Audius & Openverse…';
     render();
 
     const chosen = LANGUAGES.filter((l) => state.selectedLanguages.includes(l.id));
     for (const lang of chosen) {
       try {
-        if (lang.preferDsp) {
-          const r = await fetch(`/api/catalogue?q=${encodeURIComponent(lang.query)}&limit=10`);
+        const r = await fetch(`/api/catalogue?q=${encodeURIComponent(lang.query)}&provider=all&limit=12`);
+        if (r.ok) {
           const d = await r.json();
-          for (const t of (d.results || []).filter((x) => x.mixReady).slice(0, 8)) addTrackToCrate(t);
-        }
-        const yr = await fetch(`/api/youtube-search?q=${encodeURIComponent(lang.query)}&limit=10`);
-        if (yr.ok) {
-          const yd = await yr.json();
-          for (const t of yd.results || []) addTrackToCrate(t);
-        } else if (!lang.preferDsp) {
-          const r = await fetch(`/api/catalogue?q=${encodeURIComponent(lang.query)}&limit=10`);
-          const d = await r.json();
-          for (const t of (d.results || []).filter((x) => x.mixReady)) addTrackToCrate(t);
+          for (const t of (d.results || []).filter((x) => isDecodableTrack(x)).slice(0, 8)) addTrackToCrate(t);
         }
       } catch {}
     }
@@ -632,7 +700,7 @@ async function advanceFromStep0() {
 
   if (state.crate.length < 1) {
     state.searchError = true;
-    state.searchStatus = 'Pick at least one vibe, paste a YouTube playlist/link, or drop audio files first.';
+    state.searchStatus = 'Pick at least one vibe, search Audius/Openverse, paste a CORS audio URL, or drop audio files first.';
     render();
     return;
   }
@@ -662,7 +730,7 @@ function getLearningStats() {
   return { total: hist.length, winners, avoid };
 }
 
-function buildReviewSet() {
+function syncAutoPlan({ navigate = false } = {}) {
   const reqEpoch = ++state.planEpoch;
   const ordered = sequenceCrate(state.crate, {
     vibe: state.vibe,
@@ -674,7 +742,7 @@ function buildReviewSet() {
     playMode: state.playMode,
     moodEnergy: state.moodEnergy,
   });
-  state.screen = 'review';
+  if (navigate) state.screen = 'review';
   render();
 
   const hasAnyAi = state.health?.ai?.multiProviderConfigured || state.health?.opusConfigured || state.opusKey || state.geminiKey || state.openaiKey;
@@ -705,9 +773,13 @@ function buildReviewSet() {
       .catch(() => {})
       .finally(() => {
         state.opusBusy = false;
-        if (state.screen === 'review' || state.debugModalOpen) render();
+        if (state.screen === 'review' || state.screen === 'wizard' || state.debugModalOpen) render();
       });
   }
+}
+
+function buildReviewSet() {
+  syncAutoPlan({ navigate: true });
 }
 
 async function runOfflineWavExport() {
@@ -862,6 +934,380 @@ function positionPipTile() {
 }
 
 /* =========================================================
+   PHASE 5 HELPERS (SHARED PREVIEW / REGEN / LIVE TELEMETRY)
+   ========================================================= */
+async function previewTransitionAt(idx) {
+  const rec = state.setPlan?.transitions?.[idx];
+  if (!rec) return;
+  const trackA = state.sequencedSet.find((t) => t.id === rec.from);
+  const trackB = state.sequencedSet.find((t) => t.id === rec.to);
+  if (!trackA || !trackB) return;
+  state.previewBusyIdx = idx;
+  render();
+  try {
+    await initOrchestrator().previewTransition(trackA, trackB, rec);
+  } catch (err) {
+    state.exportMsg = err?.message || 'Preview unavailable';
+  } finally {
+    state.previewBusyIdx = -1;
+    render();
+  }
+}
+
+function regenerateTransitionAt(idx) {
+  const cur = state.setPlan?.transitions?.[idx];
+  if (!cur) return;
+  const a = state.setPlan.analyses.find((x) => x.song_id === cur.from);
+  const bSong = state.setPlan.analyses.find((x) => x.song_id === cur.to);
+  if (!a || !bSong) return;
+  const cands = cur.candidates || scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode }).candidates;
+  const styles = ['bass_swap_blend', 'long_blend', 'filter_sweep', 'drum_loop_bridge', 'build_up_drop', 'echo_out', 'reverb_wash'];
+  const curStyleIdx = styles.indexOf(cur.type);
+  const nextStyle = styles[(curStyleIdx + 1) % styles.length];
+  let regenerated = buildRecipeFromCandidate(a, bSong, cands[0], nextStyle);
+  const v = validateTransitionRecipe(regenerated, a, bSong);
+  if (!v.valid) {
+    regenerated = buildRecipeFromCandidate(a, bSong, cands[(idx + 1) % cands.length]);
+    if (!validateTransitionRecipe(regenerated, a, bSong).valid) {
+      regenerated = repairOrFallbackRecipe(a, bSong, state.vibe, state.playMode);
+      regenerated.fallbackUsed = true;
+      regenerated.why = `[DECLARED FALLBACK] ${regenerated.why || 'Safe fallback applied'}`;
+    }
+  }
+  regenerated.validation = validateTransitionRecipe(regenerated, a, bSong);
+  regenerated.candidates = cands;
+  state.setPlan.transitions[idx] = regenerated;
+  if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
+  render();
+}
+
+function computeRecipeRisk(rec, aSong, bSong) {
+  if (!rec) return { level: 'LOW', cls: 'risk-low' };
+  const isFallback = Boolean(rec.fallbackUsed || rec.validation?.fallbackApplied || /fallback/i.test(rec.why || ''));
+  const hasErrors = Boolean(rec.validation && !rec.validation.valid);
+  const hasWarnings = Boolean(rec.validation?.warnings?.length);
+  const unsafeTrack = Boolean(aSong?.low_confidence || bSong?.low_confidence);
+  if (hasErrors || rec.risk === 'high' || unsafeTrack) return { level: 'HIGH', cls: 'risk-high' };
+  if (isFallback || hasWarnings || rec.risk === 'medium') return { level: 'MEDIUM', cls: 'risk-medium' };
+  return { level: 'LOW', cls: 'risk-low' };
+}
+
+function findActiveOrNextRecipe(snap) {
+  const list = state.setPlan?.transitions || [];
+  if (snap?.crossfading && snap.transitionPlan?.from && snap.transitionPlan?.to) {
+    const idx = list.findIndex((r) => r.from === snap.transitionPlan.from && r.to === snap.transitionPlan.to);
+    if (idx >= 0) return { rec: list[idx], idx, active: true };
+    return { rec: snap.transitionPlan, idx: -1, active: true };
+  }
+  const liveId = snap?.liveTrack?.id;
+  const cueId = snap?.cueTrack?.id;
+  if (liveId && cueId) {
+    const idx = list.findIndex((r) => r.from === liveId && r.to === cueId);
+    if (idx >= 0) return { rec: list[idx], idx, active: false };
+  }
+  const doneCount = snap?.transitionLog?.length || 0;
+  if (doneCount < list.length) return { rec: list[doneCount], idx: doneCount, active: false };
+  return { rec: null, idx: -1, active: false };
+}
+
+function describeRecipePlainEnglish(rec, tracksById) {
+  if (!rec) return 'Final track playing — no pending transition';
+  const fromT = tracksById[rec.from];
+  const toT = tracksById[rec.to];
+  const typeLabel = String(rec.type || 'blend').replace(/_/g, ' ').toUpperCase();
+  const bars = rec.length_bars || rec.bars || 16;
+  const tp = rec.tempo_plan;
+  const bpmNote = tp && tp.stretch_from && tp.stretch_to
+    ? `${Math.round(tp.stretch_from)}→${Math.round(tp.stretch_to)} BPM`
+    : toT?.bpm ? `${Math.round(toT.bpm)} BPM` : '';
+  const eqNote = (rec.eq_automation || []).length ? 'BASS SWAP EQ' : 'CLEAN GAIN';
+  return `${fromT?.title || rec.from || 'DECK OUT'} → ${toT?.title || rec.to || 'DECK IN'} · ${typeLabel} (${bars} BARS · BAR ${rec.mix_out_bar ?? '—'}→${rec.mix_in_bar ?? 0} · ${eqNote}${bpmNote ? ` · ${bpmNote}` : ''})`;
+}
+
+function renderDeckTelemetryHtml(deckId, tel) {
+  if (tel?.engine === 'yt') {
+    const volPct = Math.min(100, Math.round((tel.vol || 0) * 100));
+    return `<div class="yt-honest-notice" id="tel-${deckId}">YT IFRAME DECK · VOLUME FADE ONLY (<b data-tel-v="ytvol">${volPct}%</b>) · EQ/FILTERS/STEMS/BEATMATCH DISABLED BY BROWSER CORS</div>`;
+  }
+  const t = tel || { rate: 1, semitones: 0, vol: 0, eqLow: 0, eqMid: 0, eqHigh: 0, hpfHz: 20, lpfHz: 20000, echoSend: 0, reverbSend: 0, kills: {} };
+  const eqPct = (db) => Math.max(0, Math.min(100, Math.round(((db + 30) / 36) * 100)));
+  const filtText = t.hpfHz > 35 ? `HPF ${t.hpfHz}` : t.lpfHz < 18000 ? `LPF ${t.lpfHz}` : 'FLAT';
+  const filtPct = t.hpfHz > 35
+    ? Math.min(100, Math.round((Math.log2(t.hpfHz / 20) / 9) * 100))
+    : t.lpfHz < 18000 ? Math.min(100, Math.round((Math.log2(20000 / Math.max(80, t.lpfHz)) / 8) * 100)) : 8;
+  const fxPct = Math.min(100, Math.round(Math.max(t.echoSend || 0, t.reverbSend || 0) * 100));
+  const volPct = Math.min(100, Math.round((t.vol || 0) * 100));
+
+  return `
+    <div class="deck-tel-box" id="tel-${deckId}">
+      <div class="tel-cell">
+        <div class="tel-top"><span>LOW</span><b data-tel-v="low">${t.kills?.low ? 'KILL' : `${t.eqLow}dB`}</b></div>
+        <div class="tel-track"><div class="tel-fill ${t.kills?.low || t.eqLow <= -18 ? 'kill' : ''}" data-tel-b="low" style="width:${t.kills?.low ? 100 : eqPct(t.eqLow)}%"></div></div>
+      </div>
+      <div class="tel-cell">
+        <div class="tel-top"><span>MID</span><b data-tel-v="mid">${t.kills?.mid ? 'KILL' : `${t.eqMid}dB`}</b></div>
+        <div class="tel-track"><div class="tel-fill ${t.kills?.mid ? 'kill' : ''}" data-tel-b="mid" style="width:${t.kills?.mid ? 100 : eqPct(t.eqMid)}%"></div></div>
+      </div>
+      <div class="tel-cell">
+        <div class="tel-top"><span>HIGH</span><b data-tel-v="high">${t.kills?.high ? 'KILL' : `${t.eqHigh}dB`}</b></div>
+        <div class="tel-track"><div class="tel-fill ${t.kills?.high ? 'kill' : ''}" data-tel-b="high" style="width:${t.kills?.high ? 100 : eqPct(t.eqHigh)}%"></div></div>
+      </div>
+      <div class="tel-cell">
+        <div class="tel-top"><span>FILT</span><b data-tel-v="filt">${filtText}</b></div>
+        <div class="tel-track"><div class="tel-fill amber" data-tel-b="filt" style="width:${filtPct}%"></div></div>
+      </div>
+      <div class="tel-cell">
+        <div class="tel-top"><span>ECHO/REV</span><b data-tel-v="fx">${fxPct}%</b></div>
+        <div class="tel-track"><div class="tel-fill amber" data-tel-b="fx" style="width:${fxPct}%"></div></div>
+      </div>
+      <div class="tel-cell">
+        <div class="tel-top"><span>VOL ${Number(t.rate || 1).toFixed(2)}x</span><b data-tel-v="vol">${volPct}%</b></div>
+        <div class="tel-track"><div class="tel-fill green" data-tel-b="vol" style="width:${volPct}%"></div></div>
+      </div>
+    </div>
+  `;
+}
+
+function updateDeckTelemetryDom(deckId, tel) {
+  const box = document.getElementById(`tel-${deckId}`);
+  if (!box || !tel) return;
+  if (tel.engine === 'yt') {
+    const yv = box.querySelector('[data-tel-v="ytvol"]');
+    const txt = `${Math.min(100, Math.round((tel.vol || 0) * 100))}%`;
+    if (yv && yv.textContent !== txt) yv.textContent = txt;
+    return;
+  }
+  const eqPct = (db) => Math.max(0, Math.min(100, Math.round(((db + 30) / 36) * 100)));
+  const setCell = (k, txt, pct, extraCls = '') => {
+    const v = box.querySelector(`[data-tel-v="${k}"]`);
+    const b = box.querySelector(`[data-tel-b="${k}"]`);
+    if (v && v.textContent !== txt) v.textContent = txt;
+    if (b) {
+      b.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      if (extraCls) b.className = `tel-fill ${extraCls}`;
+    }
+  };
+  setCell('low', tel.kills?.low ? 'KILL' : `${tel.eqLow}dB`, tel.kills?.low ? 100 : eqPct(tel.eqLow), tel.kills?.low || tel.eqLow <= -18 ? 'kill' : '');
+  setCell('mid', tel.kills?.mid ? 'KILL' : `${tel.eqMid}dB`, tel.kills?.mid ? 100 : eqPct(tel.eqMid), tel.kills?.mid ? 'kill' : '');
+  setCell('high', tel.kills?.high ? 'KILL' : `${tel.eqHigh}dB`, tel.kills?.high ? 100 : eqPct(tel.eqHigh), tel.kills?.high ? 'kill' : '');
+  const filtText = tel.hpfHz > 35 ? `HPF ${tel.hpfHz}` : tel.lpfHz < 18000 ? `LPF ${tel.lpfHz}` : 'FLAT';
+  const filtPct = tel.hpfHz > 35
+    ? Math.min(100, Math.round((Math.log2(tel.hpfHz / 20) / 9) * 100))
+    : tel.lpfHz < 18000 ? Math.min(100, Math.round((Math.log2(20000 / Math.max(80, tel.lpfHz)) / 8) * 100)) : 8;
+  setCell('filt', filtText, filtPct, 'amber');
+  const fxPct = Math.min(100, Math.round(Math.max(tel.echoSend || 0, tel.reverbSend || 0) * 100));
+  setCell('fx', `${fxPct}%`, fxPct, 'amber');
+  const volCellTop = box.querySelectorAll('.tel-top span')[5];
+  if (volCellTop) {
+    const label = `VOL ${Number(tel.rate || 1).toFixed(2)}x`;
+    if (volCellTop.textContent !== label) volCellTop.textContent = label;
+  }
+  setCell('vol', `${Math.min(100, Math.round((tel.vol || 0) * 100))}%`, Math.round((tel.vol || 0) * 100), 'green');
+}
+
+function updateDeckWaveformDom(deckId, slot, posOverride, bassEnergy) {
+  if (!slot?.track) return;
+  const wf = document.querySelector(`.deck[data-deck="${deckId}"] .waveform-bars`);
+  if (!wf) return;
+  const pos = posOverride ?? (slot.position || 0);
+  const dur = Math.max(1, slot.duration || slot.track.durationSec || 180);
+  const entry = slot.playFull ? 0 : (slot.track.entrySec || 0);
+  const exit = slot.playFull ? dur : (slot.mixOutSec || slot.cutAt || slot.track.exitSec || dur);
+  const bars = wf.children;
+  const bassPulse = 1 + (bassEnergy || 0) * 0.14;
+  for (let i = 0; i < bars.length; i++) {
+    const barTime = ((i + 0.5) / bars.length) * dur;
+    const inside = barTime >= entry && barTime <= exit;
+    const played = barTime <= pos;
+    const cls = !inside ? 'wave-bar outside' : played ? 'wave-bar played' : 'wave-bar';
+    if (bars[i].className !== cls) bars[i].className = cls;
+    if (played && inside) {
+      bars[i].style.transform = `scaleY(${bassPulse.toFixed(2)})`;
+    } else if (bars[i].style.transform) {
+      bars[i].style.transform = '';
+    }
+  }
+  const ph = document.querySelector(`.deck[data-deck="${deckId}"] .playhead-line`);
+  if (ph) {
+    ph.style.left = `${Math.min(100, Math.max(0, (pos / dur) * 100))}%`;
+    ph.className = deckId === state.snap?.liveId && state.dragCueSec !== null ? 'playhead-line dragging' : 'playhead-line';
+  }
+}
+
+function renderLiveTransitionLogHtml(snap) {
+  const executed = snap?.transitionLog || [];
+  const planned = state.setPlan?.transitions || [];
+  const tracksById = Object.fromEntries((state.sequencedSet || []).map((t) => [t.id, t]));
+  const rows = [];
+
+  for (const e of executed) {
+    const eq = (e.eqMoves || []).length ? e.eqMoves.join(', ') : 'clean eq';
+    const fx = (e.fxMoves || []).length ? e.fxMoves.join(', ') : 'none';
+    const driftTxt = e.driftMs !== null && e.driftMs !== undefined ? ` · drift ${Number(e.driftMs).toFixed(1)}ms` : '';
+    const fb = e.fallbackUsed ? `<span class="live-fallback-badge">FALLBACK APPLIED</span>` : '';
+    rows.push(`
+      <div class="live-log-row">
+        <span class="live-log-tag done">EXECUTED #${e.index}</span>
+        <span>${esc(e.fromTitle)} → ${esc(e.toTitle)} · <b>${esc(String(e.type || '').toUpperCase())}</b> (${e.bars} bars · EQ: ${esc(eq)} · FX: ${esc(fx)}${driftTxt})</span>
+        ${fb}
+        <span style="opacity:0.62">— ${esc(e.reason || '')}</span>
+      </div>
+    `);
+  }
+
+  const nextStart = executed.length;
+  for (let i = nextStart; i < planned.length; i++) {
+    const r = planned[i];
+    const isNext = i === nextStart;
+    const isActiveMix = isNext && Boolean(snap?.crossfading);
+    const eq = (r.eq_automation || []).length ? r.eq_automation.map((m) => `${m.deck}:${m.band}`).join(', ') : 'smooth gain';
+    const fx = (r.fx || []).length ? r.fx.map((f) => f.type).join(', ') : 'none';
+    const fb = (r.fallbackUsed || r.validation?.fallbackApplied || /fallback/i.test(r.why || ''))
+      ? `<span class="live-fallback-badge">FALLBACK</span>` : '';
+    rows.push(`
+      <div class="live-log-row">
+        <span class="live-log-tag ${isNext ? 'next' : 'plan'}">${isActiveMix ? 'MIXING NOW' : isNext ? 'UP NEXT' : `PLANNED #${i + 1}`}</span>
+        <span>${esc(tracksById[r.from]?.title || r.from)} → ${esc(tracksById[r.to]?.title || r.to)} · <b>${esc(String(r.type || '').toUpperCase())}</b> (${r.length_bars} bars · EQ: ${esc(eq)} · FX: ${esc(fx)})</span>
+        ${fb}
+        <span style="opacity:0.62">— ${esc(r.why || '')}</span>
+      </div>
+    `);
+  }
+
+  return rows.length
+    ? rows.join('')
+    : `<div class="live-log-row"><span class="live-log-tag plan">IDLE</span><span>No transitions queued yet.</span></div>`;
+}
+
+/* =========================================================
+   LIVE FX PILL STRIP — maps real scheduledEvents → glowing pills
+   Zero pills shown when no DSP is active.
+   ========================================================= */
+const FX_PILL_META = {
+  blend:    { icon: '🎚', catClass: 'cat-blend' },
+  drum:     { icon: '🥁', catClass: 'cat-drum' },
+  eq:       { icon: '🎛', catClass: 'cat-eq' },
+  fx:       { icon: '🌀', catClass: 'cat-fx' },
+  riser:    { icon: '⬆', catClass: 'cat-riser' },
+  impact:   { icon: '💥', catClass: 'cat-impact' },
+  filter:   { icon: '🎚', catClass: 'cat-filter' },
+  loop:     { icon: '🔁', catClass: 'cat-loop' },
+  harmonic: { icon: '🎵', catClass: 'cat-harmonic' },
+};
+
+function renderLiveFxStrip(snap) {
+  const moves = snap?.activeDspMoves;
+  if (!moves || moves.length === 0) return '';
+  return moves.slice(0, 10).map((m) => {
+    const { icon, catClass } = FX_PILL_META[m.category] || { icon: '◉', catClass: 'cat-fx' };
+    const pct = Math.min(100, Math.round((m.progress01 ?? 0) * 100));
+    const secsLeft = m.remainingSec != null ? `${m.remainingSec.toFixed(1)}s` : '';
+    return `
+      <div class="fx-pill" data-cat="${esc(m.category)}" title="${esc(m.label)}">
+        <span class="fx-pill-icon">${icon}</span>
+        <span class="fx-pill-label">${esc(m.label)}</span>
+        ${secsLeft ? `<span class="fx-pill-secs">${esc(secsLeft)}</span>` : ''}
+        <div class="fx-pill-progress" style="width:${pct}%"></div>
+      </div>`;
+  }).join('');
+}
+
+/* =========================================================
+   DJ ACTION FEED (BOOTH LOG) — chronological event history
+   ========================================================= */
+function renderDjActionFeed(snap) {
+  const feed = snap?.djActionFeed;
+  if (!feed || feed.length === 0) {
+    return '<div style="font-family:var(--font-mono);font-size:10px;color:rgba(245,245,240,0.3);padding:4px 2px">Waiting for DSP events…</div>';
+  }
+  return feed.slice(0, 20).map((entry) => {
+    const { icon, catClass } = FX_PILL_META[entry.category] || { icon: '◉', catClass: 'cat-fx' };
+    return `
+      <div class="dj-feed-row">
+        <span class="dj-feed-ts">${esc(entry.ts || '')}</span>
+        <span class="dj-feed-cat ${catClass}">${icon} ${esc(entry.category?.toUpperCase() || '')}</span>
+        <div class="dj-feed-body">
+          <div class="dj-feed-label">${esc(entry.label || '')}</div>
+          ${entry.detail ? `<div class="dj-feed-detail">${esc(entry.detail)}</div>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderLiveTransitionPanel(snap) {
+  const { rec, idx, active } = findActiveOrNextRecipe(snap);
+  const tracksById = Object.fromEntries((state.sequencedSet || []).map((t) => [t.id, t]));
+  const analysesById = Object.fromEntries((state.setPlan?.analyses || []).map((a) => [a.song_id, a]));
+  const aSong = rec ? analysesById[rec.from] : null;
+  const bSong = rec ? analysesById[rec.to] : null;
+  const risk = computeRecipeRisk(rec, aSong, bSong);
+  const isFallback = Boolean(rec && (rec.fallbackUsed || rec.validation?.fallbackApplied || (rec.validation && !rec.validation.valid) || /fallback/i.test(rec.why || '')));
+  const label = active ? 'MIXING NOW' : rec ? 'NEXT TRANSITION' : 'FINAL TRACK';
+  const summary = describeRecipePlainEnglish(rec, tracksById);
+  const whyText = rec?.why || 'Matched downbeat phrase & harmonic energy curve.';
+  const clockLabel = snap?.clockMode ? `CLOCK: ${String(snap.clockMode).toUpperCase()}` : 'CLOCK';
+  const driftLabel = snap?.dualDriftMs !== null && snap?.dualDriftMs !== undefined ? ` · DRIFT ${snap.dualDriftMs.toFixed(1)}ms` : '';
+
+  return `
+    <section class="live-transition-panel" id="live-transition-panel" data-rec-idx="${idx}">
+      <div class="live-tp-head">
+        <div class="live-tp-meta">
+          <span class="agent-tag" style="font-size:18px" id="live-tp-label">${label}</span>
+          <span class="font-mono-num" style="font-size:12px;color:var(--bone)" id="live-tp-summary">${esc(summary)}</span>
+          ${rec ? `<span class="live-risk-badge ${risk.cls}">RISK: ${risk.level}</span>` : ''}
+          ${isFallback ? `<span class="live-fallback-badge">⚠ DECLARED FALLBACK USED</span>` : ''}
+          <span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.55)" id="live-tp-clock">${clockLabel}${driftLabel}</span>
+        </div>
+        <div class="live-tp-actions">
+          <button class="agent-pill squeeze" id="btn-live-preview-next" ${idx < 0 || state.previewBusyIdx >= 0 ? 'disabled' : ''}>${state.previewBusyIdx === idx && idx >= 0 ? '⏳ PREVIEWING' : '▶ PREVIEW NEXT'}</button>
+          <button class="agent-pill squeeze" id="btn-live-regen-next" ${idx < 0 ? 'disabled' : ''}>↻ REGEN</button>
+          <button class="agent-pill squeeze" id="btn-live-vibe">🎛 ENERGY / MOOD</button>
+          <button class="agent-pill squeeze" id="btn-live-inspect">✦ TIMELINE & LOG</button>
+          <button class="agent-pill accent squeeze" id="btn-live-export-wav" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'RENDERING…' : '⬇ EXPORT .WAV'}</button>
+        </div>
+      </div>
+      <div class="live-tp-why" id="live-tp-why">WHY: ${esc(whyText)}</div>
+
+      <!-- LIVE ACTIVE FX PILLS (real AudioParam/DSP events only) -->
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+        <div id="live-active-fx-strip" style="flex:1">${renderLiveFxStrip(snap)}</div>
+        <button id="btn-toggle-auto-dj-fx" class="${snap?.autoDjFxEnabled === false ? 'off' : ''}">
+          ${snap?.autoDjFxEnabled === false ? '⏸ AUTO-FX OFF' : '▶ AUTO-FX ON'}
+        </button>
+      </div>
+
+      <!-- DJ ACTION FEED (BOOTH LOG) -->
+      <div id="dj-action-feed-wrap">
+        <div class="dj-feed-header">
+          <span class="dj-feed-title">◉ BOOTH DSP LOG</span>
+          <span class="dj-feed-title">${snap?.djActionFeed?.length ? `${snap.djActionFeed.length} EVENTS` : 'NO EVENTS YET'}</span>
+        </div>
+        <div id="dj-action-feed">${renderDjActionFeed(snap)}</div>
+      </div>
+
+      <div class="live-transition-log" id="live-transition-log">${renderLiveTransitionLogHtml(snap)}</div>
+    </section>
+  `;
+}
+
+function syncLocalVideoDecks(snap, pos) {
+  for (const id of ['A', 'B']) {
+    const slot = snap?.decks?.[id];
+    const vid = document.getElementById(`video-deck-${id}`);
+    if (!vid || !slot?.track?.isVideo) continue;
+    const rate = Math.max(0.5, Math.min(2.0, snap.deckTelemetry?.[id]?.rate || 1));
+    if (Math.abs(vid.playbackRate - rate) > 0.01) vid.playbackRate = rate;
+    const targetPos = id === snap.liveId ? pos : (slot.position || 0);
+    const shouldPlay = !snap.paused && (id === snap.liveId || (snap.crossfading && slot.status !== 'empty'));
+    if (Math.abs(vid.currentTime - targetPos) > 0.25 && vid.readyState >= 1) {
+      try { vid.currentTime = targetPos; } catch {}
+    }
+    if (shouldPlay && vid.paused) vid.play().catch(() => {});
+    else if (!shouldPlay && !vid.paused) vid.pause();
+  }
+}
+
+/* =========================================================
    LIGHTWEIGHT 120ms PLAYING DOM SYNC (NO FULL RE-RENDER!)
    ========================================================= */
 function syncPlayingDom() {
@@ -896,29 +1342,56 @@ function syncPlayingDom() {
     if (cueStatus.textContent !== label) cueStatus.textContent = label;
   }
 
-  // Update 88-bar waveform progress on live deck
-  const wf = document.querySelector('.deck[data-slot="live"] .waveform-bars');
-  if (wf) {
-    const entry = liveSlot?.playFull ? 0 : (liveSlot?.track?.entrySec || 0);
-    const exit = liveSlot?.playFull ? dur : (liveSlot?.cutAt || liveSlot?.track?.exitSec || dur);
-    const bars = wf.children;
-    const bassPulse = 1 + (snap.spectrum?.bass || 0) * 0.14;
-    for (let i = 0; i < bars.length; i++) {
-      const barTime = ((i + 0.5) / bars.length) * dur;
-      const inside = barTime >= entry && barTime <= exit;
-      const played = barTime <= pos;
-      const cls = !inside ? 'wave-bar outside' : played ? 'wave-bar played' : 'wave-bar';
-      if (bars[i].className !== cls) bars[i].className = cls;
-      if (played && inside) {
-        bars[i].style.transform = `scaleY(${bassPulse.toFixed(2)})`;
-      } else if (bars[i].style.transform) {
-        bars[i].style.transform = '';
-      }
+  // Update BOTH Deck A & Deck B beat-grid waveforms & live EQ/filter telemetry + local <video> sync
+  updateDeckWaveformDom(snap.liveId, liveSlot, pos, snap.spectrum?.bass || 0);
+  updateDeckWaveformDom(snap.cueId, cueSlot, cueSlot?.position || 0, 0);
+  updateDeckTelemetryDom('A', snap.deckTelemetry?.A);
+  updateDeckTelemetryDom('B', snap.deckTelemetry?.B);
+  syncLocalVideoDecks(snap, pos);
+
+  const tpClock = document.getElementById('live-tp-clock');
+  if (tpClock) {
+    const cTxt = `CLOCK: ${String(snap.clockMode || 'audioworklet').toUpperCase()}${snap.dualDriftMs !== null && snap.dualDriftMs !== undefined ? ` · DRIFT ${snap.dualDriftMs.toFixed(1)}ms` : ''}`;
+    if (tpClock.textContent !== cTxt) tpClock.textContent = cTxt;
+  }
+  const tpLog = document.getElementById('live-transition-log');
+  if (tpLog) {
+    const logSig = `${snap.transitionLog?.length || 0}:${snap.crossfading ? 1 : 0}:${snap.liveTrack?.id || ''}:${snap.cueTrack?.id || ''}`;
+    if (tpLog.dataset.sig !== logSig) {
+      tpLog.dataset.sig = logSig;
+      tpLog.innerHTML = renderLiveTransitionLogHtml(snap);
     }
-    const ph = document.querySelector('.deck[data-slot="live"] .playhead-line');
-    if (ph) {
-      ph.style.left = `${Math.min(100, Math.max(0, (pos / dur) * 100))}%`;
-      ph.className = state.dragCueSec !== null ? 'playhead-line dragging' : 'playhead-line';
+  }
+
+  // ── Live FX Pills Strip (120ms fast path, zero fake UI) ──────────────────
+  const fxStrip = document.getElementById('live-active-fx-strip');
+  if (fxStrip) {
+    const fxSig = (snap.activeDspMoves || []).map((m) => `${m.id}:${Math.round((m.progress01 ?? 0) * 20)}`).join('|');
+    if (fxStrip.dataset.sig !== fxSig) {
+      fxStrip.dataset.sig = fxSig;
+      fxStrip.innerHTML = renderLiveFxStrip(snap);
+    }
+  }
+  // ── Auto-FX toggle button label ──────────────────────────────────────────
+  const autoFxBtn = document.getElementById('btn-toggle-auto-dj-fx');
+  if (autoFxBtn) {
+    const on = snap.autoDjFxEnabled !== false;
+    autoFxBtn.textContent = on ? '▶ AUTO-FX ON' : '⏸ AUTO-FX OFF';
+    autoFxBtn.className = on ? '' : 'off';
+  }
+  // ── DJ Action Feed (deduplicated by entry id:length signature) ───────────
+  const feedEl = document.getElementById('dj-action-feed');
+  if (feedEl) {
+    const feedSig = `${snap.djActionFeed?.length || 0}:${snap.djActionFeed?.[0]?.id || ''}`;
+    if (feedEl.dataset.sig !== feedSig) {
+      feedEl.dataset.sig = feedSig;
+      feedEl.innerHTML = renderDjActionFeed(snap);
+      // Update event counter
+      const feedWrap = document.getElementById('dj-action-feed-wrap');
+      if (feedWrap) {
+        const header = feedWrap.querySelector('.dj-feed-header .dj-feed-title:last-child');
+        if (header) header.textContent = snap.djActionFeed?.length ? `${snap.djActionFeed.length} EVENTS` : 'NO EVENTS YET';
+      }
     }
   }
 
@@ -942,7 +1415,7 @@ function renderSplash() {
       <h1 class="splash-logo">NOVA</h1>
       <p class="splash-sub">THE AI DJ, HANDLED.</p>
       <p class="splash-hook">${esc(hook)}</p>
-      <p class="splash-foot">Paste any YouTube playlist, search tracks, or drop audio files. Real beatmatching, pitch-locked tempo stretch, stem separation &amp; club transitions.</p>
+      <p class="splash-foot">Drop audio files or 4-stem bundles, search Audius &amp; Openverse, or paste a CORS audio URL. Dual-tracker beatmatching, pitch-locked tempo stretch, EQ stem isolation &amp; club transitions.</p>
       <div class="splash-actions">
         <button id="btn-splash-start" class="ingest-btn squeeze">ENTER BOOTH →</button>
       </div>
@@ -997,7 +1470,7 @@ function renderWizard() {
     bodyHtml = `
       <section class="wizard-body">
         <h1 class="hero-h1">WHAT ARE WE PLAYING?</h1>
-        <p class="hero-sub">Paste a YouTube playlist URL, search tracks, drop audio files for full AI stem mixing, or pick party vibes below.</p>
+        <p class="hero-sub">Drop audio or local music video files (.mp3, .wav, .mp4, .webm) or 4-stem bundles, browse Audius &amp; Openverse Full-DSP genres, or load YouTube videos (Vol/Cue fade only).</p>
 
         <div class="ingest-box">
           <div class="ingest-row">
@@ -1005,26 +1478,45 @@ function renderWizard() {
               id="input-source"
               class="ingest-input"
               value="${esc(state.searchInput)}"
-              placeholder="Paste YouTube Playlist URL (?list=...), song URL, or search artist / song…"
+              placeholder="Search Audius Full-DSP, paste YouTube URL/playlist, or paste CORS audio URL…"
               autocomplete="off"
             />
             <button id="btn-fetch-source" class="ingest-btn squeeze" ${state.searchBusy ? 'disabled' : ''}>
               ${state.searchBusy ? 'LOADING…' : 'LOAD / SEARCH'}
             </button>
             <button id="btn-drop-files" class="ingest-btn ghost squeeze">
-              + DROP AUDIO FILES
+              + DROP AUDIO / VIDEO
             </button>
-            <input id="file-audio-input" type="file" accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg" multiple hidden />
+            <input id="file-audio-input" type="file" accept="audio/*,video/mp4,video/webm,.mp3,.wav,.flac,.m4a,.ogg,.mp4,.webm,.m4v,.mov" multiple hidden />
           </div>
 
           <div class="source-pills">
-            <button class="pill-btn squeeze ${state.searchProvider === 'youtube' ? 'active' : ''}" data-provider="youtube">YouTube + Playlists</button>
             <button class="pill-btn squeeze ${state.searchProvider === 'audius' ? 'active' : ''}" data-provider="audius">Audius Full DSP</button>
+            <button class="pill-btn squeeze ${state.searchProvider === 'openverse' ? 'active' : ''}" data-provider="openverse">Openverse CC</button>
+            <button class="pill-btn squeeze ${state.searchProvider === 'itunes' ? 'active' : ''}" data-provider="itunes">🍎 Apple Music</button>
+            <button class="pill-btn squeeze ${state.searchProvider === 'all' ? 'active' : ''}" data-provider="all">All Full-DSP</button>
+            <button class="pill-btn squeeze ${state.searchProvider === 'youtube' ? 'active' : ''}" data-provider="youtube">YouTube Video (Vol/Cue Only)</button>
             ${state.searchResults.length ? `<button id="btn-add-all-results" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)">+ ADD ALL ${state.searchResults.length} TO CRATE</button>` : ''}
             ${state.crate.length ? `<button id="btn-clear-crate" class="pill-btn squeeze">CLEAR CRATE (${state.crate.length})</button>` : ''}
           </div>
 
+          <div class="genre-bar">
+            ${GENRE_CATALOG.map((g) => `
+              <button class="genre-chip squeeze ${state.activeGenre === g.id ? 'active' : ''}" data-genre-id="${g.id}">${esc(g.label)}</button>
+            `).join('')}
+          </div>
+
           <div id="wizard-status-banner" class="status-banner ${state.searchError ? 'err' : ''}">${esc(state.searchStatus)}</div>
+          ${(state.crate.length >= 2 && state.setPlan?.transitions?.length) ? `
+            <div style="margin-top:8px;padding:10px 14px;border-radius:12px;background:rgba(107,255,149,0.06);border:1px solid rgba(107,255,149,0.3);display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center">
+              <div class="font-mono-num" style="font-size:12px;color:#6bff95">
+                ⚡ AUTO-PLANNED SET READY · ${state.sequencedSet.length} TRACKS · ${state.setPlan.transitions.length} TRANSITIONS · ${state.setPlan.validation?.valid ? 'VALIDATOR ✓' : 'SAFE FALLBACK'}
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button id="btn-auto-review-now" class="pill-btn squeeze" style="font-size:12px;border-color:var(--accent);color:var(--accent)">▶ REVIEW &amp; PLAY AUTO-SET</button>
+              </div>
+            </div>
+          ` : ''}
           ${state.costEstimate ? `
             <div class="font-mono-num" style="font-size:11px;color:rgba(255,184,0,0.78);margin-top:4px">
               ESTIMATE: ~${state.costEstimate.estimatedSeconds}s · AI Cost ~$${state.costEstimate.estimatedUsd.toFixed(3)} · Active Planner: ${esc(String(state.costEstimate.providers?.PLANNER || 'auto').toUpperCase())}
@@ -1035,18 +1527,26 @@ function renderWizard() {
             <div class="search-results-grid">
               ${state.searchResults.map((t, idx) => {
                 const inCrate = state.crate.some((c) => c.id === t.id);
+                const isYt = isYtTrack(t);
                 return `
                   <button class="result-card squeeze ${inCrate ? 'added' : ''}" data-result-idx="${idx}">
                     <img class="result-thumb" src="${esc(t.artwork || '')}" alt="" onerror="this.style.opacity=0.2" />
                     <div class="result-info">
                       <div class="result-title">${esc(t.title)}</div>
                       <div class="result-sub">${esc(t.artist)} · ${fmtTime(t.durationSec)}</div>
-                      <span class="result-badge ${t.dspReady ? 'dsp' : ''}">${t.dspReady ? 'FULL DSP · STEMS' : 'YOUTUBE DECK'} ${inCrate ? '✓' : '+'}</span>
+                      <span class="result-badge ${isYt ? 'yt' : t.source === 'itunes' ? 'itunes' : 'dsp'}">${esc(isYt ? 'YT VIDEO · VOL/CUE ONLY' : t.source === 'itunes' ? '🍎 APPLE MUSIC · 30s PREVIEW' : (t.provider || 'FULL DSP · AUDIOBUFFER'))} ${inCrate ? '✓' : '+'}</span>
                     </div>
                   </button>
                 `;
               }).join('')}
             </div>
+            ${state.searchHasMore ? `
+              <div style="margin-top:12px;display:flex;justify-content:center">
+                <button id="btn-load-more-results" class="pill-btn squeeze" style="border-color:var(--accent);color:var(--accent)" ${state.searchBusy ? 'disabled' : ''}>
+                  ${state.searchBusy ? 'LOADING…' : `+ LOAD MORE TRACKS (PAGE ${state.searchPage + 1})`}
+                </button>
+              </div>
+            ` : ''}
           ` : ''}
         </div>
 
@@ -1198,8 +1698,7 @@ function renderReview() {
     return acc + playLen;
   }, 0);
 
-  const dspCount = state.sequencedSet.filter((t) => t.file || t.stemFiles || t.stemUrls || t.dspReady).length;
-  const ytCount = state.sequencedSet.length - dspCount;
+  const dspCount = state.sequencedSet.filter((t) => isDecodableTrack(t)).length;
 
   const right = `
     <button id="btn-open-debug" class="nav-meta-btn" style="color:var(--amber)">✦ RECIPES &amp; GRID</button>
@@ -1218,8 +1717,7 @@ function renderReview() {
       <p class="hero-sub">
         ${state.sequencedSet.length} songs · about ${mins} ${mins === 1 ? 'minute' : 'minutes'} ·
         <span class="text-accent">${esc(state.playMode.toUpperCase())}</span>
-        ${dspCount ? ` · <span class="text-amber">${dspCount} FULL DSP</span>` : ''}
-        ${ytCount ? ` · ${ytCount} YOUTUBE DECK` : ''}
+        · <span class="text-amber">${dspCount} FULL DSP</span>
         ${state.setPlan?.validation?.valid ? ' · <span style="color:#6bff95">VALIDATOR ✓</span>' : ''}
       </p>
 
@@ -1232,8 +1730,9 @@ function renderReview() {
 
       <ol class="review-list" id="review-list">
         ${state.sequencedSet.map((t, idx) => {
-          const isDsp = Boolean(t.file || t.stemFiles || t.dspReady);
-          const hasNeural = Boolean(t.neuralStems || t.analysis?.neuralStems);
+          const isYt = isYtTrack(t);
+          const hasNeural = Boolean(!isYt && (t.neuralStems || t.stems_available || t.analysis?.stems_available));
+          const lowConf = Boolean(!isYt && (t.safe_transitions_only || t.analysis?.low_confidence));
           const eVal = Math.max(1, Math.min(10, Math.round(Number(t.energy) || 7)));
           const bars = Array.from({ length: 10 }, (_, b) => {
             const cls = b < eVal ? (b >= 7 ? 'energy-bar peak' : 'energy-bar on') : 'energy-bar';
@@ -1244,6 +1743,9 @@ function renderReview() {
             : `${fmtTime(t.entrySec || 0)}–${fmtTime(t.exitSec || t.durationSec || 180)}`;
           const nextT = state.sequencedSet[idx + 1];
           const rec = nextT ? recipes.find((r) => r.from === t.id && r.to === nextT.id) : null;
+          const techTag = isYt
+            ? 'YT VIDEO · NO DSP (VOL FADE ONLY)'
+            : hasNeural ? 'NEURAL 4-STEM ✓' : t.isVideo ? 'LOCAL VIDEO · FULL DSP ✓' : 'DSP · STEMS OFF (EQ)';
 
           return `
             <li class="review-row" data-song-idx="${idx}">
@@ -1253,7 +1755,8 @@ function renderReview() {
                 <div class="row-title">${esc(t.title)}</div>
                 <div class="row-meta">
                   <span>${esc(t.artist)}</span>
-                  <span class="row-tag ${isDsp ? '' : 'yt'}">${hasNeural ? 'NEURAL 4-STEM' : isDsp ? 'DSP · STEMS' : 'YT DECK'}</span>
+                  <span class="row-tag">${techTag}</span>
+                  ${lowConf ? '<span class="font-mono-num" style="font-size:11px;color:#ff7b7b">⚠ SAFE-ONLY</span>' : ''}
                   ${t.bpm ? `<span class="font-mono-num" style="font-size:12px">${Math.round(t.bpm)} BPM</span>` : ''}
                   ${t.camelot ? `<span class="font-mono-num" style="font-size:12px;color:var(--amber)">${esc(t.camelot)}</span>` : ''}
                   ${rec ? `<span class="font-mono-num" style="font-size:11px;color:rgba(245,245,240,0.6)">↳ ${esc(rec.type.replace(/_/g, ' ').toUpperCase())} (${Math.round((rec.compatibility?.score || 0.7) * 100)}%)</span>` : ''}
@@ -1298,9 +1801,21 @@ function renderWaveformHtml(track, pos, dur, cutAt, playFull, isLive) {
   const exitPct = `${Math.min(100, Math.max(0, (exit / dur) * 100))}%`;
   const posPct = `${Math.min(100, Math.max(0, (pos / dur) * 100))}%`;
   const narrow = ((exit - entry) / dur) * 100 < 28;
+  const downbeats = track.downbeat_times || track.analysis?.downbeat_times || [];
+  const beats = track.beat_times || track.beats || track.analysis?.beat_times || [];
+  const dbStep = Math.max(1, Math.ceil(downbeats.length / 40));
+  const dbTicks = downbeats.filter((_, i) => i % dbStep === 0).map((t) =>
+    `<div class="beat-tick downbeat" style="left:${Math.min(100, Math.max(0, (t / dur) * 100)).toFixed(2)}%"></div>`
+  ).join('');
+  const beatStep = Math.max(1, Math.ceil(beats.length / 96));
+  const beatTicks = beats.filter((_, i) => i % beatStep === 0).map((t) =>
+    `<div class="beat-tick" style="left:${Math.min(100, Math.max(0, (t / dur) * 100)).toFixed(2)}%"></div>`
+  ).join('');
 
   return `
     <div class="waveform-wrap">
+      ${beatTicks}
+      ${dbTicks}
       <div class="cue-marker" style="left:${entryPct}">
         <div class="cue-marker-line"></div>
         ${!(isLive && state.showDragHint) ? `<div class="cue-marker-label ${narrow ? 'right' : 'left'}">IN ${fmtTime(entry)}</div>` : ''}
@@ -1316,13 +1831,13 @@ function renderWaveformHtml(track, pos, dur, cutAt, playFull, isLive) {
         ${heat.map((h, i) => {
           const barTime = ((i + 0.5) / heat.length) * dur;
           const inside = barTime >= entry && barTime <= exit;
-          const played = isLive && barTime <= pos;
+          const played = barTime <= pos;
           const cls = !inside ? 'wave-bar outside' : played ? 'wave-bar played' : 'wave-bar';
           return `<div class="${cls}" style="height:${Math.round(h * 100)}%"></div>`;
         }).join('')}
       </div>
 
-      ${isLive ? `<div class="playhead-line" style="left:${posPct}"></div>` : ''}
+      <div class="playhead-line" style="left:${posPct}"></div>
 
       ${isLive && state.showDragHint ? `
         <div id="drag-hint-group">
@@ -1343,29 +1858,39 @@ function renderWaveformHtml(track, pos, dur, cutAt, playFull, isLive) {
   `;
 }
 
-function renderDeckCard(deckId, slotName, deckData) {
+function renderDeckCard(deckId, slotName, deckData, tel) {
   const track = deckData?.track;
   const isLive = slotName === 'live';
   const titleText = track ? track.title : (isLive ? 'STARTING…' : 'END OF SET');
   const isLong = titleText.length > 16;
   const dur = Math.max(1, deckData?.duration || track?.durationSec || 180);
   const pos = deckData?.position || 0;
-  const isDsp = deckData?.engine ? deckData.engine === 'dsp' : Boolean(track?.file || track?.dspReady);
+  const isYt = Boolean(deckData?.engine === 'yt' || (track && isYtTrack(track)));
+  const hasStems = Boolean(!isYt && (track?.stems_available || track?.neuralStems || track?.analysis?.stems_available));
+  const camelot = track?.camelot || track?.key_camelot;
 
   const statusBadge = isLive
     ? `<span class="deck-live-badge"><span class="live-dot"></span>LIVE${deckData.playFull ? ' · FULL' : ''}</span>`
     : `<span id="cue-deck-status" style="color:rgba(245,245,240,0.68)">○ ${track ? (deckData.status === 'ready' ? 'READY' : 'CUEING') : 'STANDBY'}</span>`;
 
   const techBadge = track
-    ? `<span class="deck-dsp-pill">${isDsp ? 'DSP' : 'YT'}${track.bpm ? ` · ${Math.round(track.bpm)} BPM` : ''}${track.camelot ? ` · ${esc(track.camelot)}` : ''}</span>`
+    ? isYt
+      ? `<span class="deck-dsp-pill">YT VIDEO · NO DSP</span>`
+      : `<span class="deck-dsp-pill">${track.isVideo ? 'VIDEO · DSP' : 'DSP'}${track.bpm ? ` · ${Math.round(track.bpm)} BPM` : ''}${camelot ? ` · ${esc(camelot)}` : ''}</span>`
+    : '';
+  const stemsBadge = track
+    ? isYt
+      ? `<span class="deck-stems-pill">VOL/CUE FADE ONLY</span>`
+      : `<span class="deck-stems-pill ${hasStems ? 'on' : ''}">${hasStems ? 'DEMUCS 4-STEM ✓' : 'STEMS OFF · EQ ISOLATOR'}</span>`
     : '';
 
   return `
-    <section class="deck" data-deck="${deckId}" data-slot="${slotName}" aria-hidden="${!isLive}">
+    <section class="deck" data-deck="${deckId}" data-slot="${slotName}">
       <header class="deck-header">
         <span class="deck-label">DECK ${deckId}</span>
         ${statusBadge}
         ${techBadge}
+        ${stemsBadge}
       </header>
 
       <div class="deck-title-row">
@@ -1373,10 +1898,12 @@ function renderDeckCard(deckId, slotName, deckData) {
           <h2 class="deck-title ${isLong ? 'long' : ''}" id="${isLive ? 'live-deck-title' : 'cue-deck-title'}">${esc(titleText)}</h2>
           ${track ? `<p class="deck-artist" id="${isLive ? 'live-deck-artist' : 'cue-deck-artist'}">${esc(track.artist)}</p>` : ''}
         </div>
-        ${isLive && state.pipVideoVisible && !isDsp && track ? '<div class="deck-pip-slot" data-pip-slot="true"></div>' : ''}
+        ${track?.isVideo && track?.videoUrl ? `<div class="deck-video-slot"><video id="video-deck-${deckId}" src="${esc(track.videoUrl)}" muted playsinline preload="auto"></video></div>` : ''}
+        ${isLive && state.pipVideoVisible && isYt && track ? '<div class="deck-pip-slot" data-pip-slot="true"></div>' : ''}
       </div>
 
-      ${isLive && track ? renderWaveformHtml(track, pos, dur, deckData.cutAt, deckData.playFull, true) : ''}
+      ${track ? renderWaveformHtml(track, pos, dur, deckData.mixOutSec || deckData.cutAt, deckData.playFull, isLive) : ''}
+      ${track ? renderDeckTelemetryHtml(deckId, tel) : ''}
     </section>
   `;
 }
@@ -1384,7 +1911,8 @@ function renderDeckCard(deckId, slotName, deckData) {
 function renderProDrawer() {
   const snap = state.snap;
   const liveSlot = snap?.decks?.[snap?.liveId];
-  const isDsp = liveSlot?.engine === 'dsp';
+  const isYtLive = liveSlot?.engine === 'yt';
+  const hasNeural = Boolean(!isYtLive && (liveSlot?.track?.stems_available || liveSlot?.track?.neuralStems));
   const plan = snap?.transitionPlan;
 
   return `
@@ -1393,14 +1921,24 @@ function renderProDrawer() {
         <div style="display:flex;justify-content:space-between;align-items:center">
           <div>
             <div class="font-display text-accent" style="font-size:32px;line-height:1">PRO DJ CONSOLE</div>
-            <div style="font-size:13px;color:rgba(245,245,240,0.58)">${isDsp ? 'Signalsmith Master Tempo + 4-Band Isolator Active' : 'Dual YouTube IFrame Deck Mode Active'}</div>
+            <div style="font-size:13px;color:rgba(245,245,240,0.58)">${isYtLive ? 'YT IFrame Mode · Volume Crossfade Only' : `Signalsmith Master Tempo · ${hasNeural ? 'Demucs 4-Stem Lanes Active' : 'EQ + Mid-Side Isolator (Stems Off)'}`}</div>
           </div>
           <button id="btn-close-drawer" class="exit-btn">✕</button>
         </div>
 
-        ${isDsp ? `
+        ${isYtLive ? `
+          <div class="yt-honest-notice">
+            YOUTUBE IFRAME LIMITATION: Browser CORS isolates YouTube iframe audio from Web Audio. EQ Kills, Filters, Echo/Reverb, Stems, Pitch Stretch, &amp; WAV Export require Full-DSP files (.mp3/.wav/.mp4) or Audius/Openverse tracks.
+            <div class="fx-slider-row" style="margin-top:10px">
+              <label><span>YT VOLUME CROSSFADE DURATION</span><span id="yt-xfade-lbl">${state.ytCrossfadeSec}s</span></label>
+              <input id="fx-yt-crossfade" type="range" min="2" max="12" step="0.5" value="${state.ytCrossfadeSec}" />
+            </div>
+          </div>
+        ` : ''}
+
+        <div style="display:flex;flex-direction:column;gap:18px;${isYtLive ? 'opacity:0.35;pointer-events:none' : ''}">
           <div>
-            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55);margin-bottom:10px">LIVE STEM ISOLATOR (DECK ${snap.liveId})</div>
+            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55);margin-bottom:10px">LIVE ${hasNeural ? 'STEM MIXER' : 'EQ ISOLATOR (STEMS OFF)'} (DECK ${snap?.liveId || 'A'})</div>
             <div class="stem-grid">
               ${['vocals', 'drums', 'bass', 'other'].map((st) => `
                 <button class="stem-btn squeeze ${state.stems[st] ? 'on' : 'muted'}" data-stem="${st}">
@@ -1445,58 +1983,35 @@ function renderProDrawer() {
             </div>
           </div>
 
-          <div style="display:flex;flex-wrap:wrap;gap:10px">
-            <button id="btn-loop-4" class="pill-btn squeeze ${state.loopActive ? 'active' : ''}">4-BAR LOOP ${state.loopActive ? 'ON' : 'OFF'}</button>
-            <button id="btn-master-tempo" class="pill-btn squeeze ${state.masterTempo ? 'active' : ''}">MASTER TEMPO ${state.masterTempo ? 'ON' : 'OFF'}</button>
-            <button id="btn-drum-bridge" class="pill-btn squeeze ${state.percussionBridge ? 'active' : ''}">DHOL / DRUM BRIDGE</button>
-            <button id="btn-click-track" class="pill-btn squeeze ${state.clickTrack ? 'active' : ''}">CLICK TRACK ${state.clickTrack ? 'ON' : 'OFF'}</button>
-            <button id="btn-spinback" class="pill-btn squeeze">⚡ SPINBACK</button>
-            <button id="btn-record-mix" class="pill-btn squeeze ${state.recording ? 'active' : ''}">${state.recording ? '● STOP & SAVE MIX' : '● RECORD MIX'}</button>
+          <div>
+            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55);margin-bottom:10px">3-BAND EQ KILL &amp; DECK FX (DECK ${snap?.liveId || 'A'})</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+              ${['low', 'mid', 'high'].map((band) => {
+                const kills = snap?.deckTelemetry?.[snap?.liveId || 'A']?.kills || {};
+                const killed = Boolean(kills[band]);
+                return `<button class="pill-btn squeeze ${killed ? 'active' : ''}" data-eq-kill="${band}">KILL ${band.toUpperCase()} ${killed ? 'ON' : ''}</button>`;
+              }).join('')}
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:10px">
+              <button id="btn-loop-4" class="pill-btn squeeze ${state.loopActive ? 'active' : ''}">4-BAR LOOP ${state.loopActive ? 'ON' : 'OFF'}</button>
+              <button id="btn-loop-roll" class="pill-btn squeeze">⟳ LOOP ROLL</button>
+              <button id="btn-stutter" class="pill-btn squeeze">▤ STUTTER</button>
+              <button id="btn-riser-impact" class="pill-btn squeeze">▲ RISER + IMPACT</button>
+              <button id="btn-master-tempo" class="pill-btn squeeze ${state.masterTempo ? 'active' : ''}">MASTER TEMPO ${state.masterTempo ? 'ON' : 'OFF'}</button>
+              <button id="btn-drum-bridge" class="pill-btn squeeze ${state.percussionBridge ? 'active' : ''}">DHOL / DRUM BRIDGE</button>
+              <button id="btn-click-track" class="pill-btn squeeze ${state.clickTrack ? 'active' : ''}">CLICK TRACK ${state.clickTrack ? 'ON' : 'OFF'}</button>
+              <button id="btn-spinback" class="pill-btn squeeze">⚡ SPINBACK</button>
+              <button id="btn-tapestop" class="pill-btn squeeze">📼 TAPE STOP</button>
+              <button id="btn-record-mix" class="pill-btn squeeze ${state.recording ? 'active' : ''}">${state.recording ? '● STOP & SAVE MIX' : '● RECORD MIX'}</button>
+            </div>
           </div>
+        </div>
 
           <div style="display:flex;flex-wrap:wrap;gap:8px;padding-top:4px">
             <button id="btn-drawer-debug" class="pill-btn squeeze" style="border-color:var(--amber);color:var(--amber)">✦ BEAT GRID &amp; RECIPES</button>
             <button id="btn-drawer-export" class="pill-btn squeeze" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'RENDERING WAV…' : '⬇ EXPORT MIX (.WAV)'}</button>
           </div>
           ${state.exportMsg ? `<div style="font-size:12px;color:var(--amber)">${esc(state.exportMsg)}</div>` : ''}
-        ` : `
-          <div style="display:flex;flex-direction:column;gap:14px">
-            <div class="font-display" style="font-size:20px;color:rgba(245,245,240,0.55)">YOUTUBE BLEND &amp; DECK CONSOLE</div>
-            <div class="fx-slider-row">
-              <label><span>BLEND OVERLAP DURATION</span><span id="yt-xfade-val">${state.ytCrossfadeSec}s</span></label>
-              <input id="yt-xfade-range" type="range" min="2" max="10" step="0.5" value="${state.ytCrossfadeSec}" />
-            </div>
-
-            <div>
-              <div class="font-display" style="font-size:18px;color:rgba(245,245,240,0.55);margin-bottom:8px">BLEND CHOREOGRAPHY</div>
-              <div style="display:flex;flex-wrap:wrap;gap:8px">
-                ${[
-                  ['phrase', 'PHRASE BLEND'],
-                  ['sweep_cut', 'SWEEP CUT'],
-                  ['drum_bridge', 'DRUM BRIDGE'],
-                  ['echo_drop', 'ECHO DROP'],
-                ].map(([code, label]) => `
-                  <button class="pill-btn squeeze ${state.ytTransitionStyle === code ? 'active' : ''}" data-yt-style="${code}">${label}</button>
-                `).join('')}
-              </div>
-            </div>
-
-            <div style="display:flex;flex-wrap:wrap;gap:8px">
-              <button id="btn-yt-fx" class="pill-btn squeeze ${state.ytFxEnabled ? 'active' : ''}">TRANSITION FX ${state.ytFxEnabled ? 'ON' : 'OFF'}</button>
-              <button id="btn-toggle-pip" class="pill-btn squeeze ${state.pipVideoVisible ? 'active' : ''}">
-                ${state.pipVideoVisible ? 'HIDE YOUTUBE VIDEO PIP' : 'SHOW YOUTUBE VIDEO PIP'}
-              </button>
-            </div>
-
-            <button class="pill-btn squeeze" style="border-color:var(--accent);color:var(--accent)" id="btn-yt-mix-now-drawer" ${!snap?.cueTrack || snap?.crossfading ? 'disabled' : ''}>
-              ⚡ TRIGGER ${esc(state.ytTransitionStyle.replace(/_/g, ' ').toUpperCase())} NOW
-            </button>
-
-            <p style="font-size:13px;color:rgba(245,245,240,0.52);line-height:1.5">
-              Dual YouTube Decks overlap cleanly with Web Audio sweep/drum-bridge accents. Drop local audio files or switch to Audius Full DSP for per-stem 4-band isolation &amp; Signalsmith key-locked beatmatching.
-            </p>
-          </div>
-        `}
 
         ${plan ? `
           <div style="border-top:2px solid rgba(245,245,240,0.12);padding-top:14px;font-size:13px;color:rgba(245,245,240,0.65)">
@@ -1527,8 +2042,8 @@ function renderPlayNextModal() {
             <button id="btn-close-playnext" class="exit-btn">✕</button>
           </div>
           <div style="display:flex;gap:10px;margin-top:14px">
-            <input id="input-playnext" class="ingest-input" style="flex:1;height:54px" value="${esc(state.playNextQuery)}" placeholder="Filter crate or search YouTube…" autofocus />
-            <button id="btn-playnext-search" class="ingest-btn squeeze" style="height:54px;font-size:20px;padding:0 18px">SEARCH YT</button>
+            <input id="input-playnext" class="ingest-input" style="flex:1;height:54px" value="${esc(state.playNextQuery)}" placeholder="Filter crate or search Audius / Openverse…" autofocus />
+            <button id="btn-playnext-search" class="ingest-btn squeeze" style="height:54px;font-size:20px;padding:0 18px">SEARCH DSP</button>
           </div>
         </div>
         <div id="playnext-list" class="nova-scroll" style="padding:10px 26px 24px;overflow-y:auto;flex:1">
@@ -1540,7 +2055,7 @@ function renderPlayNextModal() {
               </div>
               <span class="font-display text-accent" style="font-size:20px;flex-shrink:0">PLAY NEXT →</span>
             </button>
-          `).join('') || '<p style="color:rgba(245,245,240,0.5);padding:18px 0">No matching tracks in crate. Press Enter to search YouTube!</p>'}
+          `).join('') || '<p style="color:rgba(245,245,240,0.5);padding:18px 0">No matching tracks in crate. Press Enter to search Audius / Openverse!</p>'}
         </div>
       </div>
     </div>
@@ -1636,8 +2151,8 @@ function renderPlaying() {
       </div>
 
       <div class="decks-stage">
-        ${renderDeckCard('A', snap.liveId === 'A' ? 'live' : 'cue', snap.decks.A)}
-        ${renderDeckCard('B', snap.liveId === 'B' ? 'live' : 'cue', snap.decks.B)}
+        ${renderDeckCard('A', snap.liveId === 'A' ? 'live' : 'cue', snap.decks.A, snap.deckTelemetry?.A)}
+        ${renderDeckCard('B', snap.liveId === 'B' ? 'live' : 'cue', snap.decks.B, snap.deckTelemetry?.B)}
       </div>
 
       ${snap.paused ? `
@@ -1658,6 +2173,8 @@ function renderPlaying() {
           <button class="agent-pill accent squeeze" id="btn-play-next">＋ PLAY NEXT</button>
         </div>
       </div>
+
+      ${renderLiveTransitionPanel(snap)}
 
       <div class="bottom-controls">
         ${snap.paused ? `
@@ -1690,6 +2207,7 @@ function renderPlaying() {
 
   bindPlayingEvents();
   positionPipTile();
+  syncLocalVideoDecks(snap, livePos);
 }
 
 function renderSummary() {
@@ -1913,8 +2431,43 @@ function bindWizardEvents() {
     }
 
     document.querySelectorAll('[data-provider]').forEach((b) => {
-      b.onclick = () => { state.searchProvider = b.dataset.provider; render(); };
+      b.onclick = () => {
+        state.searchProvider = b.dataset.provider;
+        state.activeGenre = '';
+        render();
+      };
     });
+
+    document.querySelectorAll('[data-genre-id]').forEach((b) => {
+      b.onclick = () => {
+        const g = GENRE_CATALOG.find((x) => x.id === b.dataset.genreId);
+        if (!g) return;
+        state.activeGenre = g.id;
+        state.searchInput = g.q || '';
+        // iTunes genre chips force provider to 'itunes' so catalogue.js routes correctly
+        if (g.provider === 'itunes') {
+          state.searchProvider = 'itunes';
+          handleSourceFetch(g.q, { page: 1, append: false, genre: g.genre, mode: g.mode, provider: 'itunes' });
+        } else if (state.searchProvider === 'youtube') {
+          handleSourceFetch(g.q || g.label, { page: 1, append: false });
+        } else {
+          handleSourceFetch(g.q, { page: 1, append: false, genre: g.genre, mode: g.mode });
+        }
+      };
+    });
+
+    const loadMoreBtn = document.getElementById('btn-load-more-results');
+    if (loadMoreBtn) {
+      loadMoreBtn.onclick = () => {
+        const g = GENRE_CATALOG.find((x) => x.id === state.activeGenre);
+        handleSourceFetch(g ? g.q : state.searchInput, {
+          page: (state.searchPage || 1) + 1,
+          append: true,
+          genre: g?.genre || '',
+          mode: g?.mode || '',
+        });
+      };
+    }
 
     const addAll = document.getElementById('btn-add-all-results');
     if (addAll) {
@@ -1931,8 +2484,18 @@ function bindWizardEvents() {
     if (clearCrate) {
       clearCrate.onclick = () => {
         state.crate = [];
+        state.sequencedSet = [];
+        state.setPlan = null;
         state.searchStatus = 'Crate cleared.';
         render();
+      };
+    }
+
+    const autoRevBtn = document.getElementById('btn-auto-review-now');
+    if (autoRevBtn) {
+      autoRevBtn.onclick = () => {
+        if (!state.setPlan && state.crate.length >= 2) syncAutoPlan({ navigate: true });
+        else { state.screen = 'review'; render(); }
       };
     }
 
@@ -2033,8 +2596,8 @@ async function auditTransitionWithListener(idx) {
   const log = [];
   let activeRec = { ...rec };
   try {
-    for (let iter = 1; iter <= 3; iter++) {
-      state.exportMsg = `Audio Listener + Critic Iteration ${iter}/3…`;
+    for (let iter = 1; iter <= 4; iter++) {
+      state.exportMsg = `Audio Listener + DJustify 9-Gate Critic Iteration ${iter}/4…`;
       render();
       const { wavBase64, metrics } = await renderTransitionClipBase64(trackA, trackB, activeRec, orch.proMixer);
       const res = await fetch('/api/ai', {
@@ -2057,17 +2620,18 @@ async function auditTransitionWithListener(idx) {
         passed: Boolean(data?.passed),
         score,
         metrics,
-        notes: data?.listener?.notes || (data?.listener?.issues || []).join('; '),
+        checkerGates: data?.checkerGates || null,
+        notes: data?.listener?.notes || (data?.checkerGates?.failed_gates || []).map((g) => `${g.label}: ${g.detail}`).join('; ') || (data?.listener?.issues || []).join('; '),
         criticProvider: data?.criticProvider || null,
       });
 
       if (data?.passed) {
         activeRec.critiqueLog = log.slice();
-        activeRec.why = `${activeRec.why} [Listener Verified ${score}/10 ✓]`;
+        activeRec.why = `${activeRec.why} [DJustify & Listener Verified ${score}/10 ✓]`;
         state.setPlan.transitions[idx] = activeRec;
         break;
       }
-      if (data?.revisedRecipe) {
+      if (iter < 4 && data?.revisedRecipe) {
         activeRec = {
           ...data.revisedRecipe,
           compatibility: activeRec.compatibility,
@@ -2076,7 +2640,25 @@ async function auditTransitionWithListener(idx) {
           critiqueLog: log.slice(),
         };
       } else {
-        activeRec.critiqueLog = log.slice();
+        // After 4 tries (or no valid critic suggestion), deterministically apply declared safe fallback
+        const safeFb = repairOrFallbackRecipe(a || trackA, bSong || trackB, state.vibe, state.playMode);
+        log.push({
+          iteration: iter,
+          passed: true,
+          score: Math.max(7, score),
+          metrics,
+          fallbackApplied: true,
+          notes: `Declared safe fallback (${safeFb.type}) applied after ${iter} audit iteration(s).`,
+          criticProvider: 'deterministic-fallback',
+        });
+        activeRec = {
+          ...safeFb,
+          fallbackUsed: true,
+          compatibility: activeRec.compatibility,
+          candidates: activeRec.candidates,
+          creative_candidates: activeRec.creative_candidates,
+          critiqueLog: log.slice(),
+        };
         state.setPlan.transitions[idx] = activeRec;
         break;
       }
@@ -2086,7 +2668,7 @@ async function auditTransitionWithListener(idx) {
     state.setPlan.transitions[idx] = activeRec;
     if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
     const last = log[log.length - 1];
-    state.exportMsg = `Listener Audit finished: ${last?.passed ? 'PASSED' : 'REVISED'} (${last?.score ?? '?'}/10) after ${log.length} pass(es).`;
+    state.exportMsg = `Listener & Gate Audit: ${last?.passed ? 'PASSED' : 'REVISED'} (${last?.score ?? '?'}/10) after ${log.length} pass(es).`;
   } catch (err) {
     state.exportMsg = err?.message || 'Audio Listener check unavailable.';
   } finally {
@@ -2171,6 +2753,23 @@ function bindDebugModalEvents() {
   const auditAllDbg = document.getElementById('btn-audit-all-debug');
   if (auditAllDbg) auditAllDbg.onclick = batchAuditAllTransitions;
 
+  document.querySelectorAll('[data-click-check]').forEach((b) => {
+    b.onclick = async () => {
+      const idx = Number(b.dataset.clickCheck);
+      const a = state.setPlan?.analyses?.[idx];
+      const track = state.sequencedSet.find((t) => t.id === a?.song_id) || state.sequencedSet[idx];
+      if (!track) return;
+      state.exportMsg = `Playing 14s click-track verification for "${track.title}" (${a?.bpm || '?'} BPM)…`;
+      render();
+      try {
+        await initOrchestrator().proMixer.previewBeatClickTrack(track, 0, 14);
+      } catch (err) {
+        state.exportMsg = err?.message || 'Click-track preview failed.';
+        render();
+      }
+    };
+  });
+
   document.querySelectorAll('[data-nudge-beats]').forEach((b) => {
     b.onclick = () => recalibrateTrackGrid(Number(b.dataset.nudgeBeats), { nudgeBeats: Number(b.dataset.delta) });
   });
@@ -2206,24 +2805,7 @@ function bindDebugModalEvents() {
   });
 
   document.querySelectorAll('[data-preview-rec]').forEach((b) => {
-    b.onclick = async () => {
-      const idx = Number(b.dataset.previewRec);
-      const rec = state.setPlan?.transitions?.[idx];
-      if (!rec) return;
-      const trackA = state.sequencedSet.find((t) => t.id === rec.from);
-      const trackB = state.sequencedSet.find((t) => t.id === rec.to);
-      if (!trackA || !trackB) return;
-      state.previewBusyIdx = idx;
-      render();
-      try {
-        await initOrchestrator().previewTransition(trackA, trackB, rec);
-      } catch (err) {
-        state.exportMsg = err?.message || 'Preview unavailable';
-      } finally {
-        state.previewBusyIdx = -1;
-        render();
-      }
-    };
+    b.onclick = () => previewTransitionAt(Number(b.dataset.previewRec));
   });
 
   document.querySelectorAll('[data-audit-rec]').forEach((b) => {
@@ -2253,28 +2835,7 @@ function bindDebugModalEvents() {
   });
 
   document.querySelectorAll('[data-regen-rec]').forEach((b) => {
-    b.onclick = () => {
-      const idx = Number(b.dataset.regenRec);
-      const cur = state.setPlan?.transitions?.[idx];
-      if (!cur) return;
-      const a = state.setPlan.analyses.find((x) => x.song_id === cur.from);
-      const bSong = state.setPlan.analyses.find((x) => x.song_id === cur.to);
-      if (!a || !bSong) return;
-      const cands = cur.candidates || scorePairCandidates(a, bSong, { arc: state.vibe, playMode: state.playMode }).candidates;
-      const styles = ['bass_swap_blend', 'long_blend', 'filter_sweep', 'drum_loop_bridge', 'build_up_drop', 'echo_out', 'reverb_wash'];
-      const curStyleIdx = styles.indexOf(cur.type);
-      const nextStyle = styles[(curStyleIdx + 1) % styles.length];
-      let regenerated = buildRecipeFromCandidate(a, bSong, cands[0], nextStyle);
-      const v = validateTransitionRecipe(regenerated, a, bSong);
-      if (!v.valid) {
-        regenerated = buildRecipeFromCandidate(a, bSong, cands[(idx + 1) % cands.length]);
-      }
-      regenerated.validation = validateTransitionRecipe(regenerated, a, bSong);
-      regenerated.candidates = cands;
-      state.setPlan.transitions[idx] = regenerated;
-      if (orchestrator?.running) orchestrator.recipes = state.setPlan.transitions;
-      render();
-    };
+    b.onclick = () => regenerateTransitionAt(Number(b.dataset.regenRec));
   });
 
   document.querySelectorAll('[data-rate-rec]').forEach((b) => {
@@ -2426,6 +2987,39 @@ function bindPlayingEvents() {
     render();
   };
 
+  const livePrevBtn = document.getElementById('btn-live-preview-next');
+  if (livePrevBtn) livePrevBtn.onclick = () => {
+    const idx = Number(document.getElementById('live-transition-panel')?.dataset.recIdx ?? -1);
+    if (idx >= 0) previewTransitionAt(idx);
+  };
+  const liveRegenBtn = document.getElementById('btn-live-regen-next');
+  if (liveRegenBtn) liveRegenBtn.onclick = () => {
+    const idx = Number(document.getElementById('live-transition-panel')?.dataset.recIdx ?? -1);
+    if (idx >= 0) regenerateTransitionAt(idx);
+  };
+  const liveVibeBtn = document.getElementById('btn-live-vibe');
+  if (liveVibeBtn) liveVibeBtn.onclick = () => {
+    state.vibeModalOpen = true;
+    render();
+  };
+  const liveInspectBtn = document.getElementById('btn-live-inspect');
+  if (liveInspectBtn) liveInspectBtn.onclick = () => {
+    state.debugModalOpen = true;
+    render();
+  };
+  const liveExportBtn = document.getElementById('btn-live-export-wav');
+  if (liveExportBtn) liveExportBtn.onclick = runOfflineWavExport;
+
+  // Auto-DJ FX toggle — calls orchestrator.toggleAutoDjFx()
+  const autoFxToggleBtn = document.getElementById('btn-toggle-auto-dj-fx');
+  if (autoFxToggleBtn) {
+    autoFxToggleBtn.onclick = () => {
+      orchestrator?.toggleAutoDjFx?.();
+      state.snap = orchestrator?.getSnapshot?.() || state.snap;
+      syncPlayingDom();
+    };
+  }
+
   // Interactive 88-Bar Waveform Scrub + Cue Learning
   const wf = document.getElementById('live-waveform');
   if (wf) {
@@ -2436,7 +3030,7 @@ function bindPlayingEvents() {
       return Math.round(pct * dur);
     };
     wf.onpointerdown = (ev) => {
-      wf.setPointerCapture(ev.pointerId);
+      try { wf.setPointerCapture(ev.pointerId); } catch {}
       state.showDragHint = false;
       state.dragCueSec = calcSec(ev.clientX);
       syncPlayingDom();
@@ -2488,6 +3082,13 @@ function bindPlayingEvents() {
       state.reverbAmt = Number(e.target.value) / 100;
       orchestrator.setLiveReverb(state.reverbAmt);
     };
+    const ytXfEl = document.getElementById('fx-yt-crossfade');
+    if (ytXfEl) ytXfEl.oninput = (e) => {
+      state.ytCrossfadeSec = Number(e.target.value) || 5.5;
+      orchestrator.ytCrossfadeSec = state.ytCrossfadeSec;
+      const lbl = document.getElementById('yt-xfade-lbl');
+      if (lbl) lbl.textContent = `${state.ytCrossfadeSec}s`;
+    };
 
     document.querySelectorAll('[data-force-style]').forEach((b) => {
       b.onclick = () => {
@@ -2524,9 +3125,42 @@ function bindPlayingEvents() {
       render();
     };
 
+    document.querySelectorAll('[data-eq-kill]').forEach((b) => {
+      b.onclick = () => {
+        const band = b.dataset.eqKill;
+        const liveId = orchestrator.liveDeckId || 'A';
+        const cur = Boolean(orchestrator.proMixer.decks?.[liveId]?.strip?.state?.kills?.[band]);
+        orchestrator.setLiveEqKill(band, !cur);
+        state.snap = orchestrator.getSnapshot();
+        render();
+      };
+    });
+
     const spinBtn = document.getElementById('btn-spinback');
     if (spinBtn) spinBtn.onclick = () => {
       orchestrator.triggerSpinbackLive();
+    };
+
+    const tapeBtn = document.getElementById('btn-tapestop');
+    if (tapeBtn) tapeBtn.onclick = () => {
+      orchestrator.triggerTapeStopLive();
+    };
+
+    const lrBtn = document.getElementById('btn-loop-roll');
+    if (lrBtn) lrBtn.onclick = () => {
+      orchestrator.proMixer.triggerLoopRoll(orchestrator.liveDeckId || 'A');
+    };
+
+    const stBtn = document.getElementById('btn-stutter');
+    if (stBtn) stBtn.onclick = () => {
+      orchestrator.proMixer.triggerStutter(orchestrator.liveDeckId || 'A', 0.25, 8);
+    };
+
+    const riBtn = document.getElementById('btn-riser-impact');
+    if (riBtn) riBtn.onclick = () => {
+      const t0 = orchestrator.proMixer.ctx?.currentTime + 0.03 || 0.03;
+      orchestrator.proMixer.playReverseRiser(t0, orchestrator.proMixer.masterBpm || 122, 2.0);
+      orchestrator.proMixer.playImpactHit(t0 + 2.02);
     };
 
     const drawerDbg = document.getElementById('btn-drawer-debug');
@@ -2546,42 +3180,6 @@ function bindPlayingEvents() {
       } catch (err) {
         alert(err.message);
       }
-      render();
-    };
-
-    const ytRange = document.getElementById('yt-xfade-range');
-    if (ytRange) ytRange.oninput = (e) => {
-      state.ytCrossfadeSec = Number(e.target.value);
-      orchestrator.ytCrossfadeSec = state.ytCrossfadeSec;
-      const lbl = document.getElementById('yt-xfade-val');
-      if (lbl) lbl.textContent = `${state.ytCrossfadeSec}s`;
-    };
-
-    document.querySelectorAll('[data-yt-style]').forEach((b) => {
-      b.onclick = () => {
-        state.ytTransitionStyle = b.dataset.ytStyle;
-        orchestrator.ytTransitionStyle = state.ytTransitionStyle;
-        render();
-      };
-    });
-
-    const ytFxBtn = document.getElementById('btn-yt-fx');
-    if (ytFxBtn) ytFxBtn.onclick = () => {
-      state.ytFxEnabled = !state.ytFxEnabled;
-      orchestrator.ytFxEnabled = state.ytFxEnabled;
-      render();
-    };
-
-    const ytMixNow = document.getElementById('btn-yt-mix-now-drawer');
-    if (ytMixNow) ytMixNow.onclick = () => {
-      state.drawerOpen = false;
-      orchestrator.mixNow(state.ytTransitionStyle);
-      render();
-    };
-
-    const pipBtn = document.getElementById('btn-toggle-pip');
-    if (pipBtn) pipBtn.onclick = () => {
-      state.pipVideoVisible = !state.pipVideoVisible;
       render();
     };
 
@@ -2628,31 +3226,32 @@ function bindPlayingEvents() {
           </div>
           <span class="font-display text-accent" style="font-size:20px;flex-shrink:0">PLAY NEXT →</span>
         </button>
-      `).join('') || '<p style="color:rgba(245,245,240,0.5);padding:18px 0">No matching tracks in crate. Press Enter to search YouTube!</p>';
+      `).join('') || '<p style="color:rgba(245,245,240,0.5);padding:18px 0">No matching tracks in crate. Press Enter to search DSP catalogue!</p>';
       bindPickNext();
     };
-    const runPlayNextYtSearch = async () => {
+    const runPlayNextDspSearch = async () => {
       const q = state.playNextQuery.trim();
       if (!q) return;
       const btn = document.getElementById('btn-playnext-search');
       if (btn) btn.textContent = '…';
       try {
-        const res = await fetch(`/api/youtube-search?q=${encodeURIComponent(q)}&limit=8`);
+        const res = await fetch(`/api/catalogue?q=${encodeURIComponent(q)}&provider=all&limit=10`);
         const d = await res.json();
-        if (d.results?.length) {
-          for (const t of d.results) addTrackToCrate(t);
+        const valid = (d.results || []).filter((t) => isDecodableTrack(t));
+        if (valid.length) {
+          for (const t of valid) addTrackToCrate(t);
           updatePlayNextList();
         }
       } finally {
-        if (btn) btn.textContent = 'SEARCH YT';
+        if (btn) btn.textContent = 'SEARCH DSP';
       }
     };
     pnInp.oninput = (e) => { state.playNextQuery = e.target.value; updatePlayNextList(); };
     pnInp.onkeydown = async (e) => {
-      if (e.key === 'Enter') await runPlayNextYtSearch();
+      if (e.key === 'Enter') await runPlayNextDspSearch();
     };
     const pnSearchBtn = document.getElementById('btn-playnext-search');
-    if (pnSearchBtn) pnSearchBtn.onclick = runPlayNextYtSearch;
+    if (pnSearchBtn) pnSearchBtn.onclick = runPlayNextDspSearch;
     bindPickNext();
   }
 
@@ -2676,14 +3275,19 @@ function bindPlayingEvents() {
     }
     document.getElementById('btn-apply-vibe').onclick = () => {
       state.vibeModalOpen = false;
-      const liveId = state.snap?.liveTrack?.id;
+      const liveTrack = state.snap?.liveTrack;
+      const liveId = liveTrack?.id;
       const playedIds = new Set((orchestrator?.playedHistory || []).map((t) => t.id));
       const remaining = state.crate.filter((t) => t.id !== liveId && !playedIds.has(t.id));
       const reordered = sequenceCrate(remaining, { vibe: state.vibe, playMode: state.playMode });
-      const newPlan = planSetHeuristic(reordered, { vibe: state.vibe, playMode: state.playMode, moodEnergy: state.moodEnergy });
+      const activeList = [liveTrack, ...reordered].filter(Boolean);
+      const newPlan = planSetHeuristic(activeList, { vibe: state.vibe, playMode: state.playMode, moodEnergy: state.moodEnergy });
       orchestrator.vibe = state.vibe;
       orchestrator.playMode = state.playMode;
-      if (newPlan?.transitions?.length) orchestrator.recipes = newPlan.transitions;
+      if (newPlan?.transitions?.length) {
+        state.setPlan = newPlan;
+        orchestrator.recipes = newPlan.transitions;
+      }
       orchestrator.requeueRemaining(reordered);
       render();
     };

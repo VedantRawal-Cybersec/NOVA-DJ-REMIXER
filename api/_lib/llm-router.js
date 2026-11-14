@@ -1,5 +1,12 @@
 import { extractRequestKeys, loadServerEnv } from './env.js';
 
+export function getConfiguredPlannerChain() {
+  loadServerEnv();
+  const def = String(process.env.AI_PLANNER_PROVIDER || 'anthropic').trim().toLowerCase();
+  const base = ['anthropic', 'gemini', 'openai'];
+  return base.includes(def) ? [def, ...base.filter((p) => p !== def)] : base;
+}
+
 export const AI_ROLE_CHAINS = {
   PLANNER: ['anthropic', 'gemini', 'openai'],
   LYRIC_UNDERSTANDER: ['gemini', 'anthropic', 'openai'],
@@ -59,7 +66,7 @@ async function fetchWithTimeout(url, init, ms = TIMEOUT_MS) {
   }
 }
 
-async function callGeminiSingle({ apiKey, model, systemPrompt, userPrompt, audioBase64 = null, audioMime = 'audio/wav', jsonMode = true, disableThinking = true, attemptTimeoutMs = 6000 }) {
+async function callGeminiSingle({ apiKey, model, systemPrompt, userPrompt, audioBase64 = null, audioMime = 'audio/wav', jsonMode = true, disableThinking = true, attemptTimeoutMs = 6000, temperature = 0.25 }) {
   const cleanModel = String(model || 'gemini-2.5-flash').replace(/^models\//, '');
   const parts = [];
   if (audioBase64) {
@@ -68,7 +75,7 @@ async function callGeminiSingle({ apiKey, model, systemPrompt, userPrompt, audio
   parts.push({ text: userPrompt });
 
   const generationConfig = {
-    temperature: 0.25,
+    temperature: Number.isFinite(temperature) ? temperature : 0.25,
     maxOutputTokens: 3200,
     ...(jsonMode ? { responseMimeType: 'application/json' } : {}),
     ...(disableThinking && /2\.5-flash/.test(cleanModel) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
@@ -129,7 +136,7 @@ async function callGemini(opts) {
   throw lastErr || new Error('Gemini models unavailable');
 }
 
-async function callOpenAI({ apiKey, model, systemPrompt, userPrompt, jsonMode = true }) {
+async function callOpenAI({ apiKey, model, systemPrompt, userPrompt, jsonMode = true, temperature = 0.25 }) {
   const cleanModel = model || 'gpt-4.1-mini';
   const res = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -139,7 +146,7 @@ async function callOpenAI({ apiKey, model, systemPrompt, userPrompt, jsonMode = 
     },
     body: JSON.stringify({
       model: cleanModel,
-      temperature: 0.25,
+      temperature: Number.isFinite(temperature) ? temperature : 0.25,
       max_tokens: 3200,
       ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
       messages: [
@@ -177,7 +184,7 @@ async function callOpenAIWhisper({ apiKey, audioBase64, filename = 'clip.wav', m
   return res.json();
 }
 
-async function callAnthropic({ apiKey, model, systemPrompt, userPrompt }) {
+async function callAnthropic({ apiKey, model, systemPrompt, userPrompt, temperature = 0.25 }) {
   const cleanModel = model || 'claude-opus-4-1-20250805';
   const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -189,7 +196,7 @@ async function callAnthropic({ apiKey, model, systemPrompt, userPrompt }) {
     body: JSON.stringify({
       model: cleanModel,
       max_tokens: 3200,
-      temperature: 0.25,
+      temperature: Number.isFinite(temperature) ? temperature : 0.25,
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: [{ role: 'user', content: userPrompt }],
     }),
@@ -216,9 +223,11 @@ export async function invokeAiRole({
   audioMime = 'audio/wav',
   preferredProviders = null,
   expectJson = true,
+  temperature = 0.25,
 }) {
   const keys = extractRequestKeys(req);
-  const chain = (preferredProviders || AI_ROLE_CHAINS[role] || ['gemini', 'openai', 'anthropic']).filter((p) => {
+  const roleChain = role === 'PLANNER' ? getConfiguredPlannerChain() : (AI_ROLE_CHAINS[role] || ['gemini', 'openai', 'anthropic']);
+  const chain = (preferredProviders || roleChain).filter((p) => {
     if (audioBase64 && p !== 'gemini' && role !== 'TRANSCRIBER') return false;
     return Boolean(keys[p]);
   });
@@ -258,6 +267,7 @@ export async function invokeAiRole({
           audioBase64,
           audioMime,
           jsonMode: expectJson,
+          temperature,
         });
       } else if (provider === 'openai') {
         out = await callOpenAI({
@@ -266,6 +276,7 @@ export async function invokeAiRole({
           systemPrompt,
           userPrompt,
           jsonMode: expectJson,
+          temperature,
         });
       } else if (provider === 'anthropic') {
         out = await callAnthropic({
@@ -273,6 +284,7 @@ export async function invokeAiRole({
           model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-1-20250805',
           systemPrompt,
           userPrompt,
+          temperature,
         });
       }
 

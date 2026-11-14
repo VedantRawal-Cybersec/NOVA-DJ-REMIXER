@@ -5,6 +5,7 @@ import { invokeAiRole } from './_lib/llm-router.js';
 import {
   GENRE_PLAYBOOKS,
   TRANSITION_TYPES,
+  buildCueCard,
   generateCreativeIdeas,
   planSetHeuristic,
   repairOrFallbackRecipe,
@@ -12,22 +13,25 @@ import {
   validateSetPlan,
 } from '../public/js/engine/dj-brain.js';
 
-const PLANNER_SYSTEM_PROMPT = `You are NOVA's DJ brain: a principal club and festival DJ, remixer and mashup producer with deep mastery of Indian film music, Punjabi, Hindi pop, Tamil and Telugu cinema, hip-hop, house, techno and global pop.
+const PLANNER_SYSTEM_PROMPT = `You are NOVA's DJ brain: a principal club and festival DJ, remixer and mashup producer with deep mastery of Indian film music, Punjabi, Hindi pop, Tamil and Telugu cinema, hip-hop, house, techno and global pop (following DJustify arXiv Oct 2026, Vande Veire & De Bie, and Mosaikbox ISMIR 2024 principles).
 
 You receive:
 1. USER_BRIEF: mood, crowd, energy arc, playMode, moodEnergy (0-100).
 2. SONGS: array of compact song JSONs (song_id, title, artist, bpm, key_camelot, bar_count, sections, stem_activity summary, instrumental_gaps, short lyrics + theme/do_not_cut_ranges, tags, warnings).
-3. CANDIDATES: for each adjacent pair, the Top 5 mix points already scored by S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R.
+3. CANDIDATES: for each adjacent pair:
+   - cue_card_out: precomputed shortlist of phrase ends, section boundaries, post-vocal phrase ends & bass dropouts.
+   - cue_card_in: precomputed shortlist of harmonic restarts, chorus/drop onsets, verse entries & bass onsets.
+   - top_5_candidates: mix points already scored by S = 0.25*T + 0.20*K + 0.15*E + 0.15*P + 0.15*V + 0.10*G - R.
 4. RATINGS: optional few-shot good/bad transition feedback examples from past sets.
 
 PRINCIPLES & CREATIVITY ENGINE:
+- MENU-BASED PLANNING (CUE CARDS): For each track pair, pick cue-out and cue-in bars strictly from the precomputed CUE CARDS. Never invent arbitrary cut points off phrase.
+- TIGHT TEMPO RULE: Long phrase blends (long_blend) strictly restricted to within +-3.2 BPM. For bigger jumps, use echo_out, power-down/tape stop, drum_loop_bridge, or breakdown/drop slam.
+- VOCAL INTEGRITY RULE: Never cut a sung phrase mid-line. Always respect 'do_not_cut_ranges'.
+- SINGLE BASSLINE & SINGLE TREBLE: Only one track's low EQ (<= -24dB) and high EQ audible at any moment during crossfade (Vande Veire & De Bie EQ pattern).
+- STATE MACHINE VARIETY: Do not repeat the same transition family (rolling, relaxed, double_drop) consecutively.
+- LYRIC MEANING AT SET LEVEL: Weight lyric themes at set level for the overall emotional narrative arc and hook placement (Mosaikbox ISMIR 2024).
 - For EACH adjacent pair, write 3 distinct candidate creative ideas, score each for surprise, smoothness, and crowd_energy, put them in "creative_candidates", and execute the BEST idea ("ONE strong idea per transition — never pile five tricks into one").
-- Transitions start and end on phrase boundaries (8/16/32 bars) and downbeats.
-- Leave the outgoing song while it still has energy (16-32 bars before outro ends), NEVER cut inside any "do_not_cut_ranges" lyric window.
-- NEVER play two lead vocals at once. Use instrumental_gaps or duck outgoing vocals <= 0.18.
-- NEVER play two basslines at once. Cut outgoing low EQ <= -24dB before/as incoming bass enters (bass swap).
-- Harmonic Key Rule: layering melodic stems (vocal_mashup, long_blend, hook_over_groove) requires shifted Camelot distance 0 or 1 (+-2 semitones max).
-- Tempo Rule: time-stretch up to 8% (or half-time / double-time for 85-105 BPM Punjabi/Hip-Hop into 170-210 Bhangra). Larger gaps use echo_out, build_up_drop, reverse_riser_drop, or impact_cut.
 - Warnings Rule: tracks with no_clear_beat or variable_tempo get SAFE transitions ONLY (echo_out, reverb_wash, filter_sweep, impact_cut, spinback).
 - Only pick transition type from: ${TRANSITION_TYPES.join(', ')}.
 
@@ -148,6 +152,8 @@ export default async function handler(req, res) {
     candidatePairs.push({
       from: a.song_id,
       to: b.song_id,
+      cue_card_out: buildCueCard(a, 'out', brief.playMode),
+      cue_card_in: buildCueCard(b, 'in', brief.playMode),
       top_5_candidates: scorePairCandidates(a, b, { arc: brief.vibe, playMode: brief.playMode, moodEnergy }).candidates,
     });
   }
@@ -172,6 +178,7 @@ export default async function handler(req, res) {
     const firstCall = await invokeAiRole({
       role: 'PLANNER',
       req,
+      temperature: 0.6,
       systemPrompt: PLANNER_SYSTEM_PROMPT,
       userPrompt: JSON.stringify(promptPayload),
     });
@@ -188,6 +195,7 @@ export default async function handler(req, res) {
         const retryCall = await invokeAiRole({
           role: 'PLANNER',
           req,
+          temperature: 0.6,
           systemPrompt: PLANNER_SYSTEM_PROMPT,
           preferredProviders: [providerUsed],
           userPrompt: `${JSON.stringify(promptPayload)}\n\nPREVIOUS OUTPUT FAILED DETERMINISTIC VALIDATION:\n${validation.errors.join('\n')}\nFix EVERY validation error strictly and return ONLY corrected JSON.`,

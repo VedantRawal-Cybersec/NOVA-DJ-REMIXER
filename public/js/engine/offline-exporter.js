@@ -173,32 +173,129 @@ export function computeTransitionObjectiveMetrics(audioBuffer, bpm = 120) {
     }
   }
 
-  const avgLow = sumLow / Math.max(1, frameCount);
-  const avgVoc = sumVoc / Math.max(1, frameCount);
-  const midStart = Math.floor(frameCount * 0.2);
-  const midEnd = Math.max(midStart + 1, Math.floor(frameCount * 0.8));
+  const edgeCount = Math.max(1, Math.floor(frameCount * 0.14));
+  const sortedEdgeLow = [...lowVals.slice(0, edgeCount), ...lowVals.slice(Math.max(edgeCount, frameCount - edgeCount))].sort((a, b) => a - b);
+  const sortedEdgeVoc = [...vocVals.slice(0, edgeCount), ...vocVals.slice(Math.max(edgeCount, frameCount - edgeCount))].sort((a, b) => a - b);
+  const baselineLow = sortedEdgeLow[Math.floor(sortedEdgeLow.length * 0.5)] || (sumLow / Math.max(1, frameCount));
+  const baselineVoc = sortedEdgeVoc[Math.floor(sortedEdgeVoc.length * 0.5)] || (sumVoc / Math.max(1, frameCount));
+  const midStart = Math.floor(frameCount * 0.18);
+  const midEnd = Math.max(midStart + 1, Math.floor(frameCount * 0.82));
+  const avgFrameLow = lowVals.reduce((a, b) => a + b, 0) / Math.max(1, frameCount);
+  const edgeRmsVals = [...lowVals.slice(0, edgeCount), ...lowVals.slice(Math.max(edgeCount, frameCount - edgeCount))];
+  const baselineOverall = Math.max(0.02, Math.sqrt(sqTotal / Math.max(1, len)));
+
+  // Gate 3: Silent gap / energy hole detection across 150ms frames in the transition overlap
+  let holeFrames = 0;
+  let minFrameDb = 0;
+  const frameRmsSq = new Float32Array(frameCount);
+  let fIdx = 0, fAcc = 0;
+  for (let i = 0; i < len && fIdx < frameCount; i++) {
+    const m = 0.5 * (ch0[i] + ch1[i]);
+    fAcc += m * m;
+    if ((i + 1) % hop === 0) {
+      const fRms = Math.sqrt(fAcc / hop);
+      frameRmsSq[fIdx] = fRms;
+      const dipDb = 20 * Math.log10(Math.max(1e-5, fRms) / baselineOverall);
+      if (fIdx >= midStart && fIdx < midEnd) {
+        if (dipDb < minFrameDb) minFrameDb = dipDb;
+        if (dipDb < -14) holeFrames++;
+      }
+      fIdx++;
+      fAcc = 0;
+    }
+  }
+  const energy_hole_pct = Math.round((holeFrames / Math.max(1, midEnd - midStart)) * 100);
+  const min_rms_dip_db = Math.round(minFrameDb * 10) / 10;
+
   let bassSpikeFrames = 0;
   let vocSpikeFrames = 0;
   for (let f = midStart; f < midEnd; f++) {
-    if (lowVals[f] > avgLow * 1.48 && avgLow > 0.015) bassSpikeFrames++;
-    if (vocVals[f] > avgVoc * 1.45 && avgVoc > 0.012) vocSpikeFrames++;
+    if (lowVals[f] > baselineLow * 1.32 && lowVals[f] > 0.025) bassSpikeFrames++;
+    if (vocVals[f] > baselineVoc * 1.36 && vocVals[f] > 0.02) vocSpikeFrames++;
   }
   const midCount = Math.max(1, midEnd - midStart);
   const bass_overlap_pct = Math.round((bassSpikeFrames / midCount) * 100);
   const vocal_overlap_pct = Math.round((vocSpikeFrames / midCount) * 100);
   const spectral_mud_pct = Math.round((sumMud / Math.max(1e-6, sumLow + sumMud + sumVoc)) * 100);
 
-  // Beat drift proxy from peak onset regularity vs nominal BPM
+  // Measure real beat-onset alignment drift (ms) & cross-correlation phase offset on >145 Hz transient attack envelope
   const beatSec = 60 / Math.max(55, bpm || 120);
-  const winSec = len / sr;
-  const expectedBeats = Math.max(2, Math.round(winSec / beatSec));
-  const beat_drift_ms = Math.min(60, Math.round(Math.abs(winSec - expectedBeats * beatSec) * 14));
+  const stepN = Math.max(128, Math.floor(sr * 0.008));
+  const numSteps = Math.floor(len / stepN);
+  const stepRms = new Float32Array(numSteps);
+  let lpOnset = 0;
+  let stepSum = 0;
+  for (let s = 0; s < numSteps; s++) {
+    let acc = 0;
+    const base = s * stepN;
+    for (let k = 0; k < stepN; k++) {
+      const m = 0.5 * (ch0[base + k] + ch1[base + k]);
+      lpOnset = aLow * lpOnset + (1 - aLow) * m;
+      const tr = m - lpOnset;
+      acc += tr * tr;
+    }
+    stepRms[s] = Math.sqrt(acc / stepN);
+    stepSum += stepRms[s];
+  }
+  const avgStepRms = stepSum / Math.max(1, numSteps);
+  const onsets = [];
+  for (let s = 3; s < numSteps - 2; s++) {
+    const prev = (stepRms[s - 3] + stepRms[s - 2] + stepRms[s - 1]) / 3;
+    if (stepRms[s] > prev * 1.65 && stepRms[s] >= stepRms[s + 1] && stepRms[s] > Math.max(0.05, avgStepRms * 1.25)) {
+      const y0 = stepRms[s - 1], y1 = stepRms[s], y2 = stepRms[s + 1];
+      const denom = y0 - 2 * y1 + y2;
+      const delta = Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (y0 - y2) / denom)) : 0;
+      const t = ((s + delta) * stepN) / sr;
+      if (!onsets.length || t - onsets[onsets.length - 1] >= beatSec * 0.65) onsets.push(t);
+    }
+  }
+  let beat_drift_ms = 0;
+  let onset_phase_offset_ms = 0;
+  if (onsets.length >= 4) {
+    // Circular phase mean avoids ±beatSec/2 branch-cut wraparound errors
+    let sumSin = 0;
+    let sumCos = 0;
+    for (const t of onsets) {
+      const th = (2 * Math.PI * t) / beatSec;
+      sumSin += Math.sin(th);
+      sumCos += Math.cos(th);
+    }
+    const meanPhase = ((Math.atan2(sumSin, sumCos) * beatSec) / (2 * Math.PI) + beatSec) % beatSec;
+    const devs = onsets.map((t) => {
+      const d = ((t - meanPhase) % beatSec + beatSec) % beatSec;
+      return Math.min(d, beatSec - d) * 1000;
+    });
+    beat_drift_ms = Math.min(60, Math.round((devs.reduce((a, b) => a + b, 0) / devs.length) * 10) / 10);
+
+    // Split early vs late overlap onset phase lag (catches doubled/flammed kicks!)
+    const split = Math.floor(onsets.length / 2);
+    const early = onsets.slice(0, split);
+    const late = onsets.slice(split);
+    const calcMeanPhase = (arr) => {
+      let s = 0, c = 0;
+      for (const t of arr) {
+        const th = (2 * Math.PI * t) / beatSec;
+        s += Math.sin(th);
+        c += Math.cos(th);
+      }
+      return Math.atan2(s, c);
+    };
+    if (early.length >= 2 && late.length >= 2) {
+      let dTheta = calcMeanPhase(late) - calcMeanPhase(early);
+      while (dTheta > Math.PI) dTheta -= 2 * Math.PI;
+      while (dTheta < -Math.PI) dTheta += 2 * Math.PI;
+      onset_phase_offset_ms = Math.round(((dTheta / (2 * Math.PI)) * beatSec) * 1000 * 10) / 10;
+    }
+  }
 
   return {
     bass_overlap_pct,
     vocal_overlap_pct,
     beat_drift_ms,
+    onset_phase_offset_ms,
     lufs_jump_db,
+    energy_hole_pct,
+    min_rms_dip_db,
     spectral_mud_pct,
     clipping_samples,
     duration_sec: Math.round((len / sr) * 10) / 10,
@@ -271,13 +368,28 @@ export async function renderTransitionClipBase64(trackA, trackB, recipe, proMixe
   }
 
   const barUnit = overlapSec / lenBars;
+  const allLayerA = (recipe.stem_layers || []).find((s) => s.song === trackA.id && s.stem === 'all' && Array.isArray(s.gain_curve) && s.gain_curve.length >= 2);
+  const allLayerB = (recipe.stem_layers || []).find((s) => s.song === trackB.id && s.stem === 'all' && Array.isArray(s.gain_curve) && s.gain_curve.length >= 2);
+
   stripA.deckVolume.gain.setValueAtTime(1, 0);
-  stripA.deckVolume.gain.setValueAtTime(1, preRollSec);
-  stripA.deckVolume.gain.linearRampToValueAtTime(0.0001, preRollSec + overlapSec);
+  if (allLayerA) {
+    for (const [b, g] of allLayerA.gain_curve) {
+      stripA.deckVolume.gain.linearRampToValueAtTime(Math.max(0.0001, Math.min(1.5, Number(g) || 0.0001)), preRollSec + Number(b) * barUnit);
+    }
+  } else {
+    stripA.deckVolume.gain.setValueAtTime(1, preRollSec);
+    stripA.deckVolume.gain.linearRampToValueAtTime(0.0001, preRollSec + overlapSec);
+  }
 
   stripB.deckVolume.gain.setValueAtTime(0.0001, 0);
   stripB.deckVolume.gain.setValueAtTime(0.001, preRollSec);
-  stripB.deckVolume.gain.linearRampToValueAtTime(1, preRollSec + overlapSec);
+  if (allLayerB) {
+    for (const [b, g] of allLayerB.gain_curve) {
+      stripB.deckVolume.gain.linearRampToValueAtTime(Math.max(0.0001, Math.min(1.5, Number(g) || 0.0001)), preRollSec + Number(b) * barUnit);
+    }
+  } else {
+    stripB.deckVolume.gain.linearRampToValueAtTime(1, preRollSec + overlapSec);
+  }
 
   for (const eq of (recipe.eq_automation || []).filter((e) => e.deck === 'A')) {
     for (const [b, db] of eq.points || []) stripA.setEqBand(eq.band, db, preRollSec + b * barUnit, 0.04);
