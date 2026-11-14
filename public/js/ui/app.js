@@ -3327,6 +3327,13 @@ window.addEventListener('keydown', (ev) => {
 
 window.addEventListener('resize', positionPipTile);
 
+window.addEventListener('pointermove', (e) => {
+  const x = `${((e.clientX / Math.max(1, window.innerWidth)) * 100).toFixed(1)}%`;
+  const y = `${((e.clientY / Math.max(1, window.innerHeight)) * 100).toFixed(1)}%`;
+  document.documentElement.style.setProperty('--mouse-x', x);
+  document.documentElement.style.setProperty('--mouse-y', y);
+}, { passive: true });
+
 // Boot
 fetchHealth();
 loadSavedSets();
